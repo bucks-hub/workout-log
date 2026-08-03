@@ -213,7 +213,7 @@ Rules:
 9. If you can't determine the exact category, use a reasonable guess based on the exercise name
 
 Excel Data:
-${excelText.substring(0, 50000)}
+${excelText.substring(0, 400000)}
 
 IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code blocks. Do NOT include any explanation or text before or after the JSON.`;
 
@@ -230,7 +230,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
-        max_tokens: 16384,
+        max_tokens: 64000,
         messages: [
           {
             role: 'user',
