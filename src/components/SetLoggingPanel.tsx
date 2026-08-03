@@ -4,7 +4,8 @@ import { useStore } from '../store/useStore';
 import { createSet } from '../lib/sync';
 import { getLocalSetsByExercise } from '../lib/db';
 import { supabase } from '../lib/supabase';
-import { CloseIcon, PlusIcon, MinusIcon, TrashIcon, ChartIcon } from './Icons';
+import { CloseIcon, PlusIcon, MinusIcon, TrashIcon, ChartIcon, ChevronRightIcon, HistoryIcon } from './Icons';
+import { formatDate } from '../utils/date';
 
 interface SetLoggingPanelProps {
   exercise: Exercise;
@@ -19,6 +20,12 @@ interface LastPerformance {
   date: string;
 }
 
+interface RecentSession {
+  date: string;
+  sets: { weight: number; reps: number }[];
+  topWeight: number;
+}
+
 // Default weight ladder (5-100 kg in 2.5 kg increments)
 const DEFAULT_WEIGHTS = Array.from({ length: 39 }, (_, i) => 5 + i * 2.5);
 
@@ -29,6 +36,8 @@ export function SetLoggingPanel({ exercise, onClose, onViewProgress }: SetLoggin
   const [selectedWeight, setSelectedWeight] = useState<number>(0);
   const [reps, setReps] = useState<number>(10);
   const [lastPerformance, setLastPerformance] = useState<LastPerformance | null>(null);
+  const [recentSessions, setRecentSessions] = useState<RecentSession[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
   const [customWeight, setCustomWeight] = useState<string>('');
   const [showCustomInput, setShowCustomInput] = useState(false);
 
@@ -90,32 +99,59 @@ export function SetLoggingPanel({ exercise, onClose, onViewProgress }: SetLoggin
 
     setAvailableWeights(finalWeights);
 
-    // Load last performance
+    // Load last performance and recent sessions
     if (allSets.length > 0) {
-      const lastSessionSets = allSets
-        .filter((s) => s.session_id !== currentSession?.id)
-        .sort((a, b) => b.created_at.localeCompare(a.created_at));
+      // Group sets by session
+      const setsBySession = new Map<string, typeof allSets>();
+      for (const set of allSets) {
+        if (set.session_id === currentSession?.id) continue;
+        const existing = setsBySession.get(set.session_id) || [];
+        existing.push(set);
+        setsBySession.set(set.session_id, existing);
+      }
 
-      if (lastSessionSets.length > 0) {
-        const lastSession = lastSessionSets[0].session_id;
-        const lastSets = allSets.filter((s) => s.session_id === lastSession);
-
-        const heaviestSet = lastSets.reduce((max, set) =>
-          set.weight > max.weight ? set : max
-        );
-
-        const { data: sessions } = await supabase
+      // Get session dates
+      const sessionIds = Array.from(setsBySession.keys());
+      if (sessionIds.length > 0) {
+        const { data: sessionsData } = await supabase
           .from('sessions')
-          .select('date')
-          .eq('id', lastSession)
-          .limit(1);
+          .select('id, date')
+          .in('id', sessionIds)
+          .order('date', { ascending: false });
 
-        setLastPerformance({
-          weight: heaviestSet.weight,
-          reps: heaviestSet.reps,
-          setCount: lastSets.length,
-          date: sessions?.[0]?.date || 'Unknown',
-        });
+        if (sessionsData && sessionsData.length > 0) {
+          // Build recent sessions list (last 5)
+          const recent: RecentSession[] = [];
+          for (const session of sessionsData.slice(0, 5)) {
+            const sessionSets = setsBySession.get(session.id) || [];
+            if (sessionSets.length === 0) continue;
+
+            const sortedSets = sessionSets
+              .sort((a, b) => a.set_number - b.set_number)
+              .map((s) => ({ weight: s.weight, reps: s.reps }));
+
+            recent.push({
+              date: session.date,
+              sets: sortedSets,
+              topWeight: Math.max(...sessionSets.map((s) => s.weight)),
+            });
+          }
+          setRecentSessions(recent);
+
+          // Set last performance from most recent session
+          if (recent.length > 0) {
+            const lastSession = recent[0];
+            const topSet = lastSession.sets.reduce((max, set) =>
+              set.weight > max.weight ? set : max
+            );
+            setLastPerformance({
+              weight: topSet.weight,
+              reps: topSet.reps,
+              setCount: lastSession.sets.length,
+              date: lastSession.date,
+            });
+          }
+        }
       }
     }
 
@@ -257,6 +293,64 @@ export function SetLoggingPanel({ exercise, onClose, onViewProgress }: SetLoggin
               </button>
             )}
           </div>
+
+          {/* Recent History (collapsible) */}
+          {recentSessions.length > 0 && (
+            <div className="border border-[#1a1a1a] rounded-xl overflow-hidden">
+              <button
+                onClick={() => setShowHistory(!showHistory)}
+                className="w-full flex items-center justify-between p-3 bg-[#0d0d0d] hover:bg-[#1a1a1a] transition-colors"
+              >
+                <div className="flex items-center gap-2">
+                  <HistoryIcon className="w-4 h-4 text-[#f97316]" />
+                  <span className="text-sm font-medium text-white">Recent History</span>
+                  <span className="text-xs text-[#525252]">
+                    ({recentSessions.length} sessions)
+                  </span>
+                </div>
+                <ChevronRightIcon
+                  className={`w-4 h-4 text-[#525252] transition-transform ${
+                    showHistory ? 'rotate-90' : ''
+                  }`}
+                />
+              </button>
+
+              {showHistory && (
+                <div className="border-t border-[#1a1a1a] divide-y divide-[#1a1a1a]">
+                  {recentSessions.map((session) => (
+                    <div key={session.date} className="p-3 bg-[#0a0a0a]">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs font-medium text-[#a3a3a3]">
+                          {formatDate(session.date)}
+                        </span>
+                        <span className="text-xs text-[#737373]">
+                          Top: <span className="text-[#f97316] number">{session.topWeight}kg</span>
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {session.sets.map((set, setIdx) => (
+                          <button
+                            key={setIdx}
+                            onClick={() => {
+                              setSelectedWeight(set.weight);
+                              setReps(set.reps);
+                              setShowHistory(false);
+                            }}
+                            className="bg-[#1a1a1a] hover:bg-[#262626] rounded px-2 py-1 text-xs transition-colors"
+                            title="Click to use these values"
+                          >
+                            <span className="text-white number">{set.weight}</span>
+                            <span className="text-[#525252]">kg</span>
+                            <span className="text-[#f97316] ml-1">×{set.reps}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Reps stepper */}
           <div className="space-y-3">

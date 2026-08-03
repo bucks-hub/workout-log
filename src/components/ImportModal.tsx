@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from 'react';
 import { useStore } from '../store/useStore';
-import { CloseIcon, UploadIcon, KeyIcon, SparklesIcon, EyeIcon, EyeSlashIcon, CheckIcon } from './Icons';
+import { CloseIcon, UploadIcon, KeyIcon, SparklesIcon, EyeIcon, EyeSlashIcon, CheckIcon, TrashIcon, PlusIcon } from './Icons';
 import ExcelJS from 'exceljs';
 import { v4 as uuidv4 } from 'uuid';
 import { createCategory, createExercise, upsertSession, createSet, syncToServer } from '../lib/sync';
@@ -24,6 +24,15 @@ interface ImportPreview {
   exercises: { name: string; category: string }[];
   workouts: ParsedWorkout[];
   totalSets: number;
+}
+
+interface UploadedFile {
+  id: string;
+  name: string;
+  type: 'excel' | 'image';
+  data: string; // base64 for images, text for excel
+  status: 'pending' | 'processing' | 'done' | 'error';
+  error?: string;
 }
 
 // API key storage
@@ -57,7 +66,7 @@ export function ImportModal({ onClose }: ImportModalProps) {
   const [selectedWorkouts, setSelectedWorkouts] = useState<Set<number>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
   const [debugInfo, setDebugInfo] = useState<string>('');
-  const [selectedFileName, setSelectedFileName] = useState<string>('');
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -75,78 +84,94 @@ export function ImportModal({ onClose }: ImportModalProps) {
     setStep('upload');
   };
 
-  const processFile = useCallback(async (file: File) => {
-    console.log('Processing file:', file.name, file.type, file.size);
-    setSelectedFileName(file.name);
-    setDebugInfo(`Processing: ${file.name}`);
-    setError(null);
-    setStep('parsing');
+  const processExcelFile = async (file: File): Promise<string> => {
+    const buffer = await file.arrayBuffer();
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer);
+
+    let excelText = '';
+    workbook.eachSheet((sheet, sheetId) => {
+      excelText += `\n=== Sheet ${sheetId}: ${sheet.name} ===\n`;
+      sheet.eachRow((row, rowNum) => {
+        const values = row.values as any[];
+        const rowData = values.slice(1).map(v => {
+          if (v === null || v === undefined) return '';
+          if (typeof v === 'object' && v.text) return v.text;
+          if (typeof v === 'object' && v.result !== undefined) return v.result;
+          if (typeof v === 'object' && v.richText) {
+            return v.richText.map((r: any) => r.text).join('');
+          }
+          return String(v);
+        });
+        excelText += `Row ${rowNum}: ${rowData.join(' | ')}\n`;
+      });
+    });
+
+    return excelText;
+  };
+
+  const processImageFile = async (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = reader.result as string;
+        // Extract just the base64 data part (after the comma)
+        const base64Data = base64.split(',')[1];
+        resolve(base64Data);
+      };
+      reader.onerror = () => reject(new Error('Failed to read image file'));
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const addFile = useCallback(async (file: File) => {
+    const isImage = file.type.startsWith('image/');
+    const isExcel = file.name.endsWith('.xlsx') || file.name.endsWith('.xls') || file.name.endsWith('.csv');
+
+    if (!isImage && !isExcel) {
+      setError('Please upload Excel files (.xlsx, .xls, .csv) or images (.png, .jpg, .jpeg)');
+      return;
+    }
+
+    const newFile: UploadedFile = {
+      id: uuidv4(),
+      name: file.name,
+      type: isImage ? 'image' : 'excel',
+      data: '',
+      status: 'pending',
+    };
+
+    setUploadedFiles(prev => [...prev, newFile]);
 
     try {
-      // Read Excel file
-      const buffer = await file.arrayBuffer();
-      console.log('File buffer loaded, size:', buffer.byteLength);
-
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.load(buffer);
-      console.log('Workbook loaded, sheets:', workbook.worksheets.length);
-
-      // Convert workbook to text representation
-      let excelText = '';
-      let rowCount = 0;
-
-      workbook.eachSheet((sheet, sheetId) => {
-        excelText += `\n=== Sheet ${sheetId}: ${sheet.name} ===\n`;
-        sheet.eachRow((row, rowNum) => {
-          rowCount++;
-          const values = row.values as any[];
-          // Skip first element (1-indexed array)
-          const rowData = values.slice(1).map(v => {
-            if (v === null || v === undefined) return '';
-            if (typeof v === 'object' && v.text) return v.text;
-            if (typeof v === 'object' && v.result !== undefined) return v.result;
-            if (typeof v === 'object' && v.richText) {
-              return v.richText.map((r: any) => r.text).join('');
-            }
-            return String(v);
-          });
-          excelText += `Row ${rowNum}: ${rowData.join(' | ')}\n`;
-        });
-      });
-
-      console.log('Excel text extracted, rows:', rowCount, 'length:', excelText.length);
-      setDebugInfo(`Extracted ${rowCount} rows, sending to AI...`);
-
-      if (excelText.trim().length < 50) {
-        throw new Error('Excel file appears to be empty or could not be read');
+      let data: string;
+      if (isImage) {
+        data = await processImageFile(file);
+      } else {
+        data = await processExcelFile(file);
       }
 
-      // Send to Claude API for parsing
-      const parsedData = await parseWithClaude(excelText);
-
-      if (parsedData) {
-        console.log('Parsed data:', parsedData);
-        setPreview(parsedData);
-        // Select all workouts by default
-        setSelectedWorkouts(new Set(parsedData.workouts.map((_, i) => i)));
-        setStep('preview');
-      }
+      setUploadedFiles(prev =>
+        prev.map(f => f.id === newFile.id ? { ...f, data, status: 'done' } : f)
+      );
     } catch (err: any) {
-      console.error('Import error:', err);
-      setError(err.message || 'Failed to parse Excel file');
-      setStep('upload');
+      setUploadedFiles(prev =>
+        prev.map(f => f.id === newFile.id ? { ...f, status: 'error', error: err.message } : f)
+      );
     }
   }, []);
 
+  const removeFile = (fileId: string) => {
+    setUploadedFiles(prev => prev.filter(f => f.id !== fileId));
+  };
+
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    console.log('File input change event');
-    const file = e.target.files?.[0];
-    if (!file) {
-      console.log('No file selected');
-      return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    for (let i = 0; i < files.length; i++) {
+      await addFile(files[i]);
     }
-    await processFile(file);
-    // Reset input so same file can be selected again
     e.target.value = '';
   };
 
@@ -155,12 +180,11 @@ export function ImportModal({ onClose }: ImportModalProps) {
     e.stopPropagation();
     setIsDragging(false);
 
-    console.log('File dropped');
-    const file = e.dataTransfer.files[0];
-    if (file) {
-      await processFile(file);
+    const files = e.dataTransfer.files;
+    for (let i = 0; i < files.length; i++) {
+      await addFile(files[i]);
     }
-  }, [processFile]);
+  }, [addFile]);
 
   const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -175,17 +199,80 @@ export function ImportModal({ onClose }: ImportModalProps) {
   }, []);
 
   const handleClickUpload = () => {
-    console.log('Upload area clicked');
     fileInputRef.current?.click();
   };
 
-  const parseWithClaude = async (excelText: string): Promise<ImportPreview | null> => {
+  const processAllFiles = async () => {
+    const readyFiles = uploadedFiles.filter(f => f.status === 'done');
+    if (readyFiles.length === 0) {
+      setError('Please upload at least one file');
+      return;
+    }
+
+    setStep('parsing');
+    setDebugInfo(`Processing ${readyFiles.length} file(s)...`);
+
+    try {
+      const allPreviews: ImportPreview[] = [];
+
+      for (let i = 0; i < readyFiles.length; i++) {
+        const file = readyFiles[i];
+        setDebugInfo(`Analyzing file ${i + 1}/${readyFiles.length}: ${file.name}`);
+
+        const preview = await parseWithClaude(file);
+        if (preview) {
+          allPreviews.push(preview);
+        }
+      }
+
+      // Merge all previews
+      const mergedPreview = mergePreviewData(allPreviews);
+      setPreview(mergedPreview);
+      setSelectedWorkouts(new Set(mergedPreview.workouts.map((_, i) => i)));
+      setStep('preview');
+    } catch (err: any) {
+      console.error('Import error:', err);
+      setError(err.message || 'Failed to parse files');
+      setStep('upload');
+    }
+  };
+
+  const mergePreviewData = (previews: ImportPreview[]): ImportPreview => {
+    const categories = new Set<string>();
+    const exerciseMap = new Map<string, { name: string; category: string }>();
+    const workouts: ParsedWorkout[] = [];
+
+    for (const preview of previews) {
+      // Add categories (exact match)
+      preview.categories.forEach(c => categories.add(c));
+
+      // Add exercises (use exact name as key)
+      preview.exercises.forEach(e => {
+        const key = `${e.name}__${e.category}`;
+        if (!exerciseMap.has(key)) {
+          exerciseMap.set(key, e);
+        }
+      });
+
+      // Add workouts
+      workouts.push(...preview.workouts);
+    }
+
+    return {
+      categories: Array.from(categories),
+      exercises: Array.from(exerciseMap.values()),
+      workouts,
+      totalSets: workouts.reduce((sum, w) => sum + w.sets.length, 0),
+    };
+  };
+
+  const parseWithClaude = async (file: UploadedFile): Promise<ImportPreview | null> => {
     const storedKey = getStoredApiKey();
     if (!storedKey) {
       throw new Error('API key not configured');
     }
 
-    const prompt = `Analyze this workout Excel data and extract all workout information. Return a JSON object with the following structure:
+    const prompt = `Analyze this workout data and extract all workout information. Return a JSON object with the following structure:
 
 {
   "categories": ["Category1", "Category2"],
@@ -201,24 +288,58 @@ export function ImportModal({ onClose }: ImportModalProps) {
   "totalSets": 42
 }
 
-Rules:
-1. Extract ALL workout data you can find
-2. Identify categories (muscle groups like Chest, Back, Legs, Arms, Shoulders, Core, etc.)
-3. Identify exercises (Bench Press, Squat, Deadlift, etc.)
-4. For each workout entry, extract date, exercise, weight (in kg), and reps
-5. If weight is in lbs, convert to kg (divide by 2.205)
-6. If date format is unclear, use best guess in YYYY-MM-DD format
-7. Group sets that were done on the same day for the same exercise
-8. Be thorough - extract every single set you can find
-9. If you can't determine the exact category, use a reasonable guess based on the exercise name
+CRITICAL RULES - YOU MUST FOLLOW THESE EXACTLY:
+1. **PRESERVE EXACT NAMES**: Use the EXACT spelling and capitalization of category and exercise names as written in the data. DO NOT rephrase, correct spelling, or change names in any way.
+   - If user wrote "Bech press" → use "Bech press" (NOT "Bench Press")
+   - If user wrote "CHEST" → use "CHEST" (NOT "Chest")
+   - If user wrote "legz" → use "legz" (NOT "Legs")
+2. Extract ALL workout data you can find
+3. For categories, use EXACTLY what is written. If no category is specified, use "Uncategorized"
+4. For exercises, use EXACTLY the name as written by the user
+5. For each workout entry, extract date, exercise, weight (in kg), and reps
+6. If weight is in lbs, convert to kg (divide by 2.205) but keep the exercise name EXACTLY as written
+7. If date format is unclear, use best guess in YYYY-MM-DD format
+8. Group sets that were done on the same day for the same exercise
+9. Be thorough - extract every single set you can find
 
-Excel Data:
-${excelText.substring(0, 400000)}
+REMEMBER: The user's original spelling and naming MUST be preserved exactly. Never correct or modify names.
 
 IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code blocks. Do NOT include any explanation or text before or after the JSON.`;
 
-    console.log('Calling Claude API...');
-    setDebugInfo('Calling Claude API...');
+    let messages: any[];
+
+    if (file.type === 'image') {
+      // For images, use vision capability
+      messages = [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/jpeg',
+                data: file.data,
+              },
+            },
+            {
+              type: 'text',
+              text: prompt,
+            },
+          ],
+        },
+      ];
+    } else {
+      // For Excel, send as text
+      messages = [
+        {
+          role: 'user',
+          content: `${prompt}\n\nExcel Data:\n${file.data.substring(0, 400000)}`,
+        },
+      ];
+    }
+
+    console.log('Calling Claude API for file:', file.name);
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -231,12 +352,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
         max_tokens: 64000,
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
+        messages,
       }),
     });
 
@@ -246,7 +362,6 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
       const errorData = await response.json().catch(() => ({}));
       console.error('API error:', errorData);
 
-      // Extract the actual error message
       const errorMessage = errorData?.error?.message
         || (typeof errorData === 'string' ? errorData : JSON.stringify(errorData));
 
@@ -266,43 +381,32 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
     }
 
     const data = await response.json();
-    console.log('Full API response:', JSON.stringify(data, null, 2));
-
     const content = data.content?.[0]?.text;
-    console.log('Content type:', typeof content);
-    console.log('Content value:', content);
 
     if (!content) {
       console.error('No content in response. Full data:', data);
       throw new Error('No response from Claude API. Check console for details.');
     }
 
-    console.log('Raw AI response content (first 1000 chars):', content.substring(0, 1000));
-
-    // Try multiple approaches to extract JSON
+    // Extract JSON from response
     let jsonString = content;
 
-    // Approach 1: Remove markdown code blocks (```json ... ```)
-    // Handle both ```json and ``` formats
     if (content.includes('```')) {
       const startMarker = content.indexOf('```');
       let startContent = startMarker + 3;
-      // Skip "json" if present
       if (content.substring(startContent, startContent + 4) === 'json') {
         startContent += 4;
       }
-      // Skip newline
       while (content[startContent] === '\n' || content[startContent] === ' ') {
         startContent++;
       }
       const endMarker = content.lastIndexOf('```');
       if (endMarker > startMarker) {
         jsonString = content.substring(startContent, endMarker).trim();
-        console.log('Extracted from code block:', jsonString.substring(0, 200));
       }
     }
 
-    // Approach 2: Find JSON object using balanced braces
+    // Find JSON object
     let braceCount = 0;
     let startIdx = -1;
     let endIdx = -1;
@@ -320,38 +424,24 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
       }
     }
 
-    // Handle truncated responses - try to repair the JSON
     let extractedJson: string;
 
     if (startIdx === -1) {
-      console.error('Could not find opening brace in response');
       throw new Error('Could not find JSON in AI response. Please try again.');
     }
 
     if (endIdx === -1) {
-      // Response was truncated - try to repair it
-      console.warn('JSON appears to be truncated, attempting to repair...');
+      // Truncated response - try to repair
       extractedJson = jsonString.substring(startIdx);
-
-      // Count open brackets and close them
       let openBraces = 0;
       let openBrackets = 0;
       let inString = false;
       let escaped = false;
 
       for (const char of extractedJson) {
-        if (escaped) {
-          escaped = false;
-          continue;
-        }
-        if (char === '\\') {
-          escaped = true;
-          continue;
-        }
-        if (char === '"') {
-          inString = !inString;
-          continue;
-        }
+        if (escaped) { escaped = false; continue; }
+        if (char === '\\') { escaped = true; continue; }
+        if (char === '"') { inString = !inString; continue; }
         if (!inString) {
           if (char === '{') openBraces++;
           else if (char === '}') openBraces--;
@@ -360,41 +450,27 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
         }
       }
 
-      // Remove any incomplete trailing content (after last complete entry)
-      // Find the last complete workout entry
       const lastCompleteWorkout = extractedJson.lastIndexOf('}]},');
       const lastCompleteEntry = extractedJson.lastIndexOf('}},');
       const cutPoint = Math.max(lastCompleteWorkout, lastCompleteEntry);
 
       if (cutPoint > 0) {
         extractedJson = extractedJson.substring(0, cutPoint + 3);
-        // Close remaining brackets
         extractedJson += '], "totalSets": 0}';
       } else {
-        // Just close all open brackets
-        extractedJson = extractedJson.replace(/,\s*$/, ''); // Remove trailing comma
+        extractedJson = extractedJson.replace(/,\s*$/, '');
         extractedJson += ']'.repeat(openBrackets) + '}'.repeat(openBraces);
       }
-
-      console.log('Repaired JSON (last 200 chars):', extractedJson.substring(extractedJson.length - 200));
     } else {
       extractedJson = jsonString.substring(startIdx, endIdx);
     }
 
-    console.log('Extracted JSON length:', extractedJson.length);
-
     try {
-      // Clean up the JSON string - remove any trailing commas before } or ]
       const cleanJson = extractedJson
         .replace(/,(\s*[}\]])/g, '$1')
-        .replace(/}\s*,\s*]/g, '}]'); // Fix }}, to }]
+        .replace(/}\s*,\s*]/g, '}]');
 
       const parsed = JSON.parse(cleanJson);
-      console.log('Parsed successfully:', {
-        categories: parsed.categories?.length,
-        exercises: parsed.exercises?.length,
-        workouts: parsed.workouts?.length
-      });
 
       return {
         categories: parsed.categories || [],
@@ -404,8 +480,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
       };
     } catch (parseErr) {
       console.error('JSON parse error:', parseErr);
-      console.error('Attempted to parse (last 500 chars):', extractedJson.substring(extractedJson.length - 500));
-      throw new Error('Failed to parse AI response. Your file may have too much data. Try a smaller file or fewer rows.');
+      throw new Error(`Failed to parse data from ${file.name}. Try a smaller file.`);
     }
   };
 
@@ -418,30 +493,29 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
     setImportProgress({ current: 0, total });
 
     try {
-      // Create a map of existing categories and exercises
+      // Create maps using EXACT names (case-sensitive for matching)
       const categoryMap = new Map<string, string>();
       const exerciseMap = new Map<string, string>();
 
-      // Add existing ones
-      categories.forEach(c => categoryMap.set(c.name.toLowerCase(), c.id));
-      exercises.forEach(e => exerciseMap.set(`${e.name.toLowerCase()}_${e.category_id}`, e.id));
+      // Add existing categories and exercises (exact match)
+      categories.forEach(c => categoryMap.set(c.name, c.id));
+      exercises.forEach(e => exerciseMap.set(`${e.name}__${e.category_id}`, e.id));
 
-      // Create new categories
+      // Create new categories (preserving exact names)
       for (const catName of preview.categories) {
-        const key = catName.toLowerCase();
-        if (!categoryMap.has(key)) {
+        if (!categoryMap.has(catName)) {
           const newCat = await createCategory(user.id, catName, categories.length + categoryMap.size);
-          categoryMap.set(key, newCat.id);
+          categoryMap.set(catName, newCat.id);
           addCategory(newCat);
         }
       }
 
-      // Create new exercises
+      // Create new exercises (preserving exact names)
       for (const ex of preview.exercises) {
-        const categoryId = categoryMap.get(ex.category.toLowerCase());
+        const categoryId = categoryMap.get(ex.category);
         if (!categoryId) continue;
 
-        const key = `${ex.name.toLowerCase()}_${categoryId}`;
+        const key = `${ex.name}__${categoryId}`;
         if (!exerciseMap.has(key)) {
           const catExercises = exercises.filter(e => e.category_id === categoryId);
           const newEx = await createExercise(user.id, categoryId, ex.name, catExercises.length + 1);
@@ -462,7 +536,6 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
 
       // Create sessions and sets
       for (const [date, dayWorkouts] of workoutsByDate) {
-        // Create session for this date
         const session = {
           id: uuidv4(),
           user_id: user.id,
@@ -471,12 +544,11 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
         };
         await upsertSession(session);
 
-        // Create sets for each workout
         for (const workout of dayWorkouts) {
-          const categoryId = categoryMap.get(workout.category.toLowerCase());
+          const categoryId = categoryMap.get(workout.category);
           if (!categoryId) continue;
 
-          const exerciseId = exerciseMap.get(`${workout.exercise.toLowerCase()}_${categoryId}`);
+          const exerciseId = exerciseMap.get(`${workout.exercise}__${categoryId}`);
           if (!exerciseId) continue;
 
           for (let i = 0; i < workout.sets.length; i++) {
@@ -495,7 +567,6 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
         }
       }
 
-      // Final sync
       await syncToServer();
       setStep('done');
     } catch (err: any) {
@@ -524,6 +595,8 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
   const deselectAll = () => {
     setSelectedWorkouts(new Set());
   };
+
+  const readyFilesCount = uploadedFiles.filter(f => f.status === 'done').length;
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -556,7 +629,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
                   <span className="font-medium">Anthropic API Key</span>
                 </div>
                 <p className="text-sm text-[#737373]">
-                  Your API key is used to analyze the Excel file. It's stored locally in your browser and never sent to our servers.
+                  Your API key is used to analyze files. It's stored locally and never sent to our servers.
                 </p>
                 <div className="relative">
                   <input
@@ -597,7 +670,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
           {step === 'upload' && (
             <div className="space-y-4">
               <div
-                className={`p-8 border-2 border-dashed rounded-xl text-center cursor-pointer transition-colors ${
+                className={`p-6 border-2 border-dashed rounded-xl text-center cursor-pointer transition-colors ${
                   isDragging
                     ? 'border-[#f97316] bg-[#f97316]/10'
                     : 'border-[#333] hover:border-[#f97316]'
@@ -607,42 +680,100 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
               >
-                <UploadIcon className={`w-12 h-12 mx-auto mb-3 ${isDragging ? 'text-[#f97316]' : 'text-[#525252]'}`} />
+                <UploadIcon className={`w-10 h-10 mx-auto mb-2 ${isDragging ? 'text-[#f97316]' : 'text-[#525252]'}`} />
                 <p className="text-white font-medium">
-                  {isDragging ? 'Drop your file here' : 'Click to upload or drag & drop'}
+                  {isDragging ? 'Drop files here' : 'Click to upload or drag & drop'}
                 </p>
                 <p className="text-sm text-[#737373] mt-1">
-                  .xlsx or .xls files supported
+                  Excel (.xlsx, .xls) or Images (.png, .jpg)
                 </p>
-                {selectedFileName && (
-                  <p className="text-sm text-[#f97316] mt-2">
-                    Last file: {selectedFileName}
-                  </p>
-                )}
+                <p className="text-xs text-[#525252] mt-1">
+                  Upload multiple files to combine data
+                </p>
               </div>
 
-              {/* Hidden file input - MUST be outside the click target */}
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".xlsx,.xls,.csv"
+                accept=".xlsx,.xls,.csv,image/*"
+                multiple
                 onChange={handleFileSelect}
                 className="hidden"
               />
 
+              {/* Uploaded Files List */}
+              {uploadedFiles.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium text-white">
+                      Files ({uploadedFiles.length})
+                    </span>
+                    <button
+                      onClick={handleClickUpload}
+                      className="text-sm text-[#f97316] hover:underline flex items-center gap-1"
+                    >
+                      <PlusIcon className="w-4 h-4" />
+                      Add more
+                    </button>
+                  </div>
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {uploadedFiles.map((file) => (
+                      <div
+                        key={file.id}
+                        className="flex items-center justify-between p-3 bg-[#1a1a1a] rounded-xl"
+                      >
+                        <div className="flex items-center gap-3 flex-1 min-w-0">
+                          <div className={`w-2 h-2 rounded-full ${
+                            file.status === 'done' ? 'bg-[#22c55e]' :
+                            file.status === 'error' ? 'bg-[#ef4444]' :
+                            file.status === 'processing' ? 'bg-[#f97316] animate-pulse' :
+                            'bg-[#525252]'
+                          }`} />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm text-white truncate">{file.name}</p>
+                            <p className="text-xs text-[#525252]">
+                              {file.type === 'image' ? 'Image' : 'Excel'}
+                              {file.error && <span className="text-[#ef4444] ml-2">{file.error}</span>}
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => removeFile(file.id)}
+                          className="btn-icon text-[#ef4444] hover:bg-[#ef4444]/10"
+                        >
+                          <TrashIcon className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="p-4 bg-[#1a1a1a] rounded-xl space-y-2">
                 <p className="text-sm font-medium text-white">How it works:</p>
                 <ol className="text-sm text-[#737373] space-y-1 list-decimal list-inside">
-                  <li>Upload any Excel file with workout data</li>
-                  <li>AI analyzes the format automatically</li>
-                  <li>Review detected workouts</li>
-                  <li>Import selected entries</li>
+                  <li>Upload Excel files or images of workout logs</li>
+                  <li>AI analyzes each file separately</li>
+                  <li>Data is combined and deduplicated</li>
+                  <li>Review and import selected entries</li>
                 </ol>
+                <p className="text-xs text-[#525252] mt-2">
+                  Names are preserved exactly as you wrote them
+                </p>
               </div>
 
-              <button onClick={() => setStep('config')} className="btn-secondary w-full">
-                Change API Key
-              </button>
+              <div className="flex gap-2">
+                <button onClick={() => setStep('config')} className="btn-secondary flex-1">
+                  Change API Key
+                </button>
+                <button
+                  onClick={processAllFiles}
+                  disabled={readyFilesCount === 0}
+                  className="btn-primary flex-1"
+                >
+                  Process {readyFilesCount} file{readyFilesCount !== 1 ? 's' : ''}
+                </button>
+              </div>
             </div>
           )}
 
@@ -661,7 +792,6 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
           {/* Step 4: Preview */}
           {step === 'preview' && preview && (
             <div className="space-y-4">
-              {/* Summary */}
               <div className="grid grid-cols-3 gap-3">
                 <div className="p-3 bg-[#1a1a1a] rounded-xl text-center">
                   <div className="text-2xl font-bold text-[#f97316] number">{preview.categories.length}</div>
@@ -677,7 +807,6 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
                 </div>
               </div>
 
-              {/* Selection controls */}
               <div className="flex items-center justify-between">
                 <span className="text-sm text-[#737373]">
                   {selectedWorkouts.size} of {preview.workouts.length} entries selected
@@ -693,11 +822,10 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
                 </div>
               </div>
 
-              {/* Workout list */}
               <div className="max-h-60 overflow-y-auto space-y-2">
                 {preview.workouts.length === 0 ? (
                   <div className="p-4 text-center text-[#737373]">
-                    No workouts detected in the file
+                    No workouts detected in the files
                   </div>
                 ) : (
                   preview.workouts.map((workout, index) => (
@@ -738,7 +866,7 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
               </div>
 
               <div className="flex gap-2">
-                <button onClick={() => setStep('upload')} className="btn-secondary flex-1">
+                <button onClick={() => { setStep('upload'); setPreview(null); }} className="btn-secondary flex-1">
                   Back
                 </button>
                 <button
