@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useStore } from '../store/useStore';
-import { createCategory, createExercise } from '../lib/sync';
+import { createCategory, createExercise, syncToServer } from '../lib/sync';
 import { supabase } from '../lib/supabase';
 import { addToSyncQueue, saveLocalCategory, saveLocalExercise } from '../lib/db';
 import { CloseIcon, PlusIcon, EditIcon, TrashIcon } from '../components/Icons';
@@ -62,6 +62,9 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
     await saveLocalCategory(updated);
     await addToSyncQueue({ action: 'update', table: 'categories', payload: updated });
     setEditingCategory(null);
+
+    // Immediately sync to server
+    syncToServer().catch(console.error);
   };
 
   const handleEditExercise = async () => {
@@ -76,6 +79,9 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
     await saveLocalExercise(updated);
     await addToSyncQueue({ action: 'update', table: 'exercises', payload: updated });
     setEditingExercise(null);
+
+    // Immediately sync to server
+    syncToServer().catch(console.error);
   };
 
   const handleDeleteCategory = async (category: Category) => {
@@ -148,6 +154,9 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
     }
 
     setDeleteConfirm(null);
+
+    // Sync to ensure consistency (deletions already done via Supabase, but sync queue cleanup)
+    syncToServer().catch(console.error);
   };
 
   const getCategoryExercises = (categoryId: string) => {
@@ -158,9 +167,9 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-content max-h-[85vh]" onClick={(e) => e.stopPropagation()}>
+      <div className="modal-content-flex max-h-[85vh]" onClick={(e) => e.stopPropagation()}>
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-[#1a1a1a]">
+        <div className="flex items-center justify-between p-4 border-b border-[#1a1a1a] flex-shrink-0">
           <h2 className="text-lg font-semibold text-white">Manage Equipment</h2>
           <button onClick={onClose} className="btn-icon">
             <CloseIcon className="w-5 h-5" />
@@ -168,7 +177,7 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
         </div>
 
         {/* Tabs */}
-        <div className="flex border-b border-[#1a1a1a]">
+        <div className="flex border-b border-[#1a1a1a] flex-shrink-0">
           <button
             onClick={() => setActiveTab('categories')}
             className={`flex-1 px-4 py-3 text-sm font-medium transition-colors ${
@@ -191,8 +200,8 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
           </button>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {/* Content - scrollable body */}
+        <div className="modal-body space-y-4">
           {activeTab === 'categories' ? (
             <>
               {categories.length === 0 ? (
@@ -238,32 +247,6 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
                 </div>
               )}
 
-              {showAddCategory ? (
-                <div className="p-4 bg-[#0a0a0a] rounded-xl border border-[#1a1a1a] space-y-3">
-                  <input
-                    type="text"
-                    value={newCategoryName}
-                    onChange={(e) => setNewCategoryName(e.target.value)}
-                    placeholder="Category name (e.g., Legs)"
-                    className="input"
-                    autoFocus
-                    onKeyPress={(e) => e.key === 'Enter' && handleAddCategory()}
-                  />
-                  <div className="flex gap-2">
-                    <button onClick={handleAddCategory} disabled={!newCategoryName.trim()} className="btn-primary flex-1">
-                      Add
-                    </button>
-                    <button onClick={() => { setShowAddCategory(false); setNewCategoryName(''); }} className="btn-secondary">
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <button onClick={() => setShowAddCategory(true)} className="btn-primary w-full">
-                  <PlusIcon className="w-5 h-5" />
-                  Add Category
-                </button>
-              )}
             </>
           ) : (
             <>
@@ -318,42 +301,75 @@ export function ManageEquipment({ onClose }: ManageEquipmentProps) {
                 </div>
               )}
 
-              {showAddExercise ? (
-                <div className="p-4 bg-[#0a0a0a] rounded-xl border border-[#1a1a1a] space-y-3">
-                  <select
-                    value={selectedCategoryId}
-                    onChange={(e) => setSelectedCategoryId(e.target.value)}
-                    className="input"
-                  >
-                    <option value="">Select category...</option>
-                    {categories.sort((a, b) => a.sort_order - b.sort_order).map((cat) => (
-                      <option key={cat.id} value={cat.id}>{cat.name}</option>
-                    ))}
-                  </select>
-                  <input
-                    type="text"
-                    value={newExerciseName}
-                    onChange={(e) => setNewExerciseName(e.target.value)}
-                    placeholder="Exercise name (e.g., Bench Press)"
-                    className="input"
-                    onKeyPress={(e) => e.key === 'Enter' && handleAddExercise()}
-                  />
-                  <div className="flex gap-2">
-                    <button onClick={handleAddExercise} disabled={!newExerciseName.trim() || !selectedCategoryId} className="btn-primary flex-1">
-                      Add
-                    </button>
-                    <button onClick={() => { setShowAddExercise(false); setNewExerciseName(''); setSelectedCategoryId(''); }} className="btn-secondary">
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <button onClick={() => setShowAddExercise(true)} disabled={categories.length === 0} className="btn-primary w-full">
-                  <PlusIcon className="w-5 h-5" />
-                  Add Exercise
-                </button>
-              )}
             </>
+          )}
+        </div>
+
+        {/* Fixed Footer with Add buttons */}
+        <div className="modal-footer">
+          {activeTab === 'categories' ? (
+            showAddCategory ? (
+              <div className="space-y-3">
+                <input
+                  type="text"
+                  value={newCategoryName}
+                  onChange={(e) => setNewCategoryName(e.target.value)}
+                  placeholder="Category name (e.g., Legs)"
+                  className="input"
+                  autoFocus
+                  onKeyPress={(e) => e.key === 'Enter' && handleAddCategory()}
+                />
+                <div className="flex gap-2">
+                  <button onClick={handleAddCategory} disabled={!newCategoryName.trim()} className="btn-primary flex-1">
+                    Add
+                  </button>
+                  <button onClick={() => { setShowAddCategory(false); setNewCategoryName(''); }} className="btn-secondary">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => setShowAddCategory(true)} className="btn-primary w-full">
+                <PlusIcon className="w-5 h-5" />
+                Add Category
+              </button>
+            )
+          ) : (
+            showAddExercise ? (
+              <div className="space-y-3">
+                <select
+                  value={selectedCategoryId}
+                  onChange={(e) => setSelectedCategoryId(e.target.value)}
+                  className="input"
+                >
+                  <option value="">Select category...</option>
+                  {categories.sort((a, b) => a.sort_order - b.sort_order).map((cat) => (
+                    <option key={cat.id} value={cat.id}>{cat.name}</option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={newExerciseName}
+                  onChange={(e) => setNewExerciseName(e.target.value)}
+                  placeholder="Exercise name (e.g., Bench Press)"
+                  className="input"
+                  onKeyPress={(e) => e.key === 'Enter' && handleAddExercise()}
+                />
+                <div className="flex gap-2">
+                  <button onClick={handleAddExercise} disabled={!newExerciseName.trim() || !selectedCategoryId} className="btn-primary flex-1">
+                    Add
+                  </button>
+                  <button onClick={() => { setShowAddExercise(false); setNewExerciseName(''); setSelectedCategoryId(''); }} className="btn-secondary">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => setShowAddExercise(true)} disabled={categories.length === 0} className="btn-primary w-full">
+                <PlusIcon className="w-5 h-5" />
+                Add Exercise
+              </button>
+            )
           )}
         </div>
 

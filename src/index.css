@@ -2,9 +2,13 @@
 
 @theme {
   --font-mono: ui-monospace, 'SF Mono', 'Roboto Mono', 'Courier New', monospace;
-  --color-accent: #f97316;
-  --color-accent-hover: #ea580c;
-  --color-accent-light: rgba(249, 115, 22, 0.1);
+  --color-accent: #FF6600;
+  --color-accent-hover: #e55c00;
+  --color-accent-active: #cc5200;
+  --color-accent-light: rgba(255, 102, 0, 0.1);
+  --color-bg-primary: #000000;
+  --color-bg-card: #121212;
+  --color-bg-elevated: #1a1a1a;
 }
 
 * {
@@ -63,26 +67,31 @@ input, select, textarea {
   border-radius: 12px;
   border: none;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
+  box-shadow: 0 4px 14px rgba(255, 102, 0, 0.25);
 }
 
 .btn-primary:hover {
   background-color: var(--color-accent-hover);
   transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(255, 102, 0, 0.35);
 }
 
 .btn-primary:active {
-  transform: translateY(0);
+  transform: translateY(0) scale(0.98);
+  background-color: var(--color-accent-active);
+  box-shadow: 0 2px 8px rgba(255, 102, 0, 0.2);
 }
 
 .btn-primary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   transform: none;
+  box-shadow: none;
 }
 
 /* Secondary button - Dark gray */
@@ -108,6 +117,7 @@ input, select, textarea {
 
 .btn-secondary:active {
   background-color: #333;
+  transform: scale(0.98);
 }
 
 .btn-secondary:disabled {
@@ -135,9 +145,15 @@ input, select, textarea {
   background-color: #b91c1c;
 }
 
+.btn-danger:active {
+  background-color: #991b1b;
+  transform: scale(0.98);
+}
+
 .btn-danger:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+  transform: none;
 }
 
 /* Ghost button */
@@ -219,8 +235,8 @@ select.input {
 
 /* Card */
 .card {
-  background-color: #0a0a0a;
-  border: 1px solid #1a1a1a;
+  background-color: var(--color-bg-card);
+  border: 1px solid var(--color-bg-elevated);
   border-radius: 16px;
 }
 
@@ -315,16 +331,59 @@ select.input {
 /* Page container */
 .page {
   flex: 1;
-  padding-bottom: 80px; /* Space for bottom nav */
+  padding-bottom: 100px; /* Increased space for bottom nav and safety */
+}
+
+/* Modal footer - fixed at bottom */
+.modal-footer {
+  position: sticky;
+  bottom: 0;
+  background: #0a0a0a;
+  padding: 16px;
+  border-top: 1px solid #1a1a1a;
+  margin-top: auto;
+}
+
+/* Modal body - scrollable content */
+.modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+/* Modal with fixed footer structure */
+.modal-content-flex {
+  background-color: #0a0a0a;
+  border: 1px solid #1a1a1a;
+  border-radius: 24px 24px 0 0;
+  width: 100%;
+  max-height: 90vh;
+  max-height: 90dvh;
+  display: flex;
+  flex-direction: column;
+  animation: slideUp 0.2s ease;
+}
+
+@media (min-width: 640px) {
+  .modal-content-flex {
+    max-width: 480px;
+    border-radius: 24px;
+    animation: fadeIn 0.2s ease;
+  }
+}
+
+/* Safe area padding for bottom content */
+.pb-safe {
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
 }
 
 /* Exercise card */
 .exercise-card {
-  background-color: #0a0a0a;
-  border: 1px solid #1a1a1a;
+  background-color: var(--color-bg-card);
+  border: 2px solid transparent;
   border-radius: 12px;
   padding: 16px;
-  transition: all 0.15s ease;
+  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   cursor: pointer;
   width: 100%;
   text-align: left;
@@ -332,12 +391,16 @@ select.input {
 
 .exercise-card:hover {
   border-color: #333;
-  background-color: #111;
+  background-color: #1a1a1a;
+}
+
+.exercise-card:active {
+  transform: scale(0.98);
 }
 
 .exercise-card.logged {
-  border-color: var(--color-accent);
-  background-color: var(--color-accent-light);
+  border-color: rgba(255, 102, 0, 0.4);
+  background-color: rgba(255, 102, 0, 0.1);
 }
 
 /* Weight chip */
@@ -463,4 +526,42 @@ select.input {
   color: #737373;
   margin-bottom: 24px;
   max-width: 280px;
+}
+
+/* Loading skeleton */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--color-bg-card) 25%,
+    var(--color-bg-elevated) 50%,
+    var(--color-bg-card) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 8px;
+}
+
+/* Better focus states for accessibility */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Smooth transitions for interactive elements */
+button,
+a,
+.exercise-card {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }

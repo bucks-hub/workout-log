@@ -6,6 +6,7 @@ import { Today } from './pages/Today';
 import { History } from './pages/History';
 import { Settings } from './pages/Settings';
 import { BottomNav } from './components/BottomNav';
+import { SyncStatusBar } from './components/SyncStatusBar';
 import type { TabType } from './components/BottomNav';
 import { useStore } from './store/useStore';
 import { loadFromServer, syncToServer, cleanupOrphanedSyncItems } from './lib/sync';
@@ -14,7 +15,7 @@ import './utils/debug';
 
 function AppContent() {
   const { user, loading } = useAuth();
-  const { setCategories, setExercises, setPendingSyncCount } = useStore();
+  const { setCategories, setExercises, setPendingSyncCount, setSyncStatus, setLastSyncTime, setSyncError } = useStore();
   const [needsSetup, setNeedsSetup] = useState(false);
   const [isInitializing, setIsInitializing] = useState(true);
   const [activeTab, setActiveTab] = useState<TabType>('today');
@@ -76,46 +77,82 @@ function AppContent() {
     init();
   }, [user, setCategories, setExercises, setPendingSyncCount]);
 
-  // Periodic sync
+  // Periodic sync with status updates
   useEffect(() => {
     if (!user) return;
 
-    const syncInterval = setInterval(async () => {
-      await syncToServer();
-      const queue = await getSyncQueue();
-      setPendingSyncCount(queue.length);
-    }, 30000);
+    const performSync = async () => {
+      try {
+        setSyncStatus('syncing');
+        await syncToServer();
+        const queue = await getSyncQueue();
+        setPendingSyncCount(queue.length);
+        setSyncStatus('success');
+        setLastSyncTime(Date.now());
+        setSyncError(null);
+        // Reset to idle after showing success
+        setTimeout(() => setSyncStatus('idle'), 2000);
+      } catch (error: any) {
+        console.error('Sync error:', error);
+        setSyncStatus('error');
+        setSyncError(error.message || 'Sync failed');
+        // Reset to idle after showing error
+        setTimeout(() => setSyncStatus('idle'), 3000);
+      }
+    };
+
+    const syncInterval = setInterval(performSync, 30000);
 
     return () => clearInterval(syncInterval);
-  }, [user, setPendingSyncCount]);
+  }, [user, setPendingSyncCount, setSyncStatus, setLastSyncTime, setSyncError]);
 
   // Sync on visibility change
   useEffect(() => {
     const handleVisibilityChange = async () => {
       if (document.visibilityState === 'visible' && user) {
-        await syncToServer();
-        const queue = await getSyncQueue();
-        setPendingSyncCount(queue.length);
+        try {
+          setSyncStatus('syncing');
+          await syncToServer();
+          const queue = await getSyncQueue();
+          setPendingSyncCount(queue.length);
+          setSyncStatus('success');
+          setLastSyncTime(Date.now());
+          setTimeout(() => setSyncStatus('idle'), 2000);
+        } catch (error) {
+          console.error('Sync error:', error);
+          setSyncStatus('error');
+          setTimeout(() => setSyncStatus('idle'), 3000);
+        }
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [user, setPendingSyncCount]);
+  }, [user, setPendingSyncCount, setSyncStatus, setLastSyncTime]);
 
   // Sync on network reconnect
   useEffect(() => {
     const handleOnline = async () => {
       if (user) {
-        await syncToServer();
-        const queue = await getSyncQueue();
-        setPendingSyncCount(queue.length);
+        try {
+          setSyncStatus('syncing');
+          await syncToServer();
+          const queue = await getSyncQueue();
+          setPendingSyncCount(queue.length);
+          setSyncStatus('success');
+          setLastSyncTime(Date.now());
+          setTimeout(() => setSyncStatus('idle'), 2000);
+        } catch (error) {
+          console.error('Sync error:', error);
+          setSyncStatus('error');
+          setTimeout(() => setSyncStatus('idle'), 3000);
+        }
       }
     };
 
     window.addEventListener('online', handleOnline);
     return () => window.removeEventListener('online', handleOnline);
-  }, [user, setPendingSyncCount]);
+  }, [user, setPendingSyncCount, setSyncStatus, setLastSyncTime]);
 
   if (loading || isInitializing) {
     return (
@@ -138,6 +175,7 @@ function AppContent() {
 
   return (
     <div className="min-h-screen bg-black flex flex-col">
+      <SyncStatusBar />
       {activeTab === 'today' && <Today />}
       {activeTab === 'history' && <History />}
       {activeTab === 'settings' && <Settings />}

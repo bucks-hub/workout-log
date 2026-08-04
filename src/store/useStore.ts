@@ -34,6 +34,16 @@ interface AppState {
   // Sync status
   pendingSyncCount: number;
   setPendingSyncCount: (count: number) => void;
+  syncStatus: 'idle' | 'syncing' | 'success' | 'error';
+  setSyncStatus: (status: 'idle' | 'syncing' | 'success' | 'error') => void;
+  lastSyncTime: number | null;
+  setLastSyncTime: (time: number | null) => void;
+  syncError: string | null;
+  setSyncError: (error: string | null) => void;
+
+  // Session version - incremented when session is finished to trigger History refresh
+  sessionVersion: number;
+  incrementSessionVersion: () => void;
 
   // Loading states
   isLoading: boolean;
@@ -94,6 +104,16 @@ export const useStore = create<AppState>((set) => ({
   // Sync
   pendingSyncCount: 0,
   setPendingSyncCount: (count) => set({ pendingSyncCount: count }),
+  syncStatus: 'idle',
+  setSyncStatus: (status) => set({ syncStatus: status }),
+  lastSyncTime: null,
+  setLastSyncTime: (time) => set({ lastSyncTime: time }),
+  syncError: null,
+  setSyncError: (error) => set({ syncError: error }),
+
+  // Session version
+  sessionVersion: 0,
+  incrementSessionVersion: () => set((state) => ({ sessionVersion: state.sessionVersion + 1 })),
 
   // Loading
   isLoading: false,

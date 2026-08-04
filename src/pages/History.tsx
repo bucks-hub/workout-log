@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { useStore } from '../store/useStore';
 import { supabase } from '../lib/supabase';
 import { formatDate, getTodayDate } from '../utils/date';
@@ -32,19 +32,16 @@ interface ExerciseHistory {
 type ViewMode = 'date' | 'exercise';
 
 export function History() {
-  const { user, exercises, categories } = useStore();
+  const { user, exercises, categories, sessionVersion } = useStore();
   const [sessions, setSessions] = useState<SessionWithSets[]>([]);
   const [loading, setLoading] = useState(true);
   const [deleteConfirm, setDeleteConfirm] = useState<SessionWithSets | null>(null);
   const [selectedSession, setSelectedSession] = useState<SessionWithSets | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('date');
   const [expandedExercise, setExpandedExercise] = useState<string | null>(null);
+  const [fullHistoryExercise, setFullHistoryExercise] = useState<ExerciseHistory | null>(null);
 
-  useEffect(() => {
-    loadSessions();
-  }, [user]);
-
-  const loadSessions = async () => {
+  const loadSessions = useCallback(async () => {
     if (!user) return;
 
     setLoading(true);
@@ -63,7 +60,11 @@ export function History() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [user]);
+
+  useEffect(() => {
+    loadSessions();
+  }, [loadSessions, sessionVersion]);
 
   const handleDeleteSession = async () => {
     if (!deleteConfirm) return;
@@ -80,12 +81,9 @@ export function History() {
   // Build exercise history from sessions
   const exerciseHistories = useMemo((): ExerciseHistory[] => {
     const historyMap = new Map<string, ExerciseHistory>();
-    const today = getTodayDate();
 
     for (const session of sessions) {
-      // Skip today's session (it's in progress)
-      if (session.date === today) continue;
-
+      // Include all sessions (including today's completed ones)
       const setsByExercise = new Map<string, Set[]>();
       for (const set of session.sets) {
         const existing = setsByExercise.get(set.exercise_id) || [];
@@ -408,9 +406,12 @@ export function History() {
                         </div>
 
                         {history.sessions.length > 5 && (
-                          <div className="p-3 text-center text-xs text-[#525252]">
-                            +{history.sessions.length - 5} more sessions
-                          </div>
+                          <button
+                            onClick={() => setFullHistoryExercise(history)}
+                            className="w-full p-3 text-center text-xs text-[#f97316] hover:bg-[#1a1a1a] transition-colors font-medium"
+                          >
+                            View all {history.sessions.length} sessions →
+                          </button>
                         )}
                       </div>
                     )}
@@ -463,6 +464,113 @@ export function History() {
                   Cancel
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Full Exercise History Modal */}
+      {fullHistoryExercise && (
+        <div className="modal-backdrop" onClick={() => setFullHistoryExercise(null)}>
+          <div
+            className="modal-content-flex"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between p-4 border-b border-[#1a1a1a]">
+              <div>
+                <h2 className="text-lg font-semibold text-white">
+                  {fullHistoryExercise.exercise.name}
+                </h2>
+                <p className="text-sm text-[#737373]">
+                  {fullHistoryExercise.categoryName} · {fullHistoryExercise.sessions.length} sessions
+                </p>
+              </div>
+              <button
+                onClick={() => setFullHistoryExercise(null)}
+                className="btn-icon"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Stats Summary */}
+            <div className="p-4 border-b border-[#1a1a1a] bg-[#0d0d0d]">
+              <div className="flex items-center justify-around">
+                <div className="text-center">
+                  <div className="flex items-center justify-center gap-1 text-[#f97316]">
+                    <TrophyIcon className="w-4 h-4" />
+                    <span className="text-xl font-bold number">{fullHistoryExercise.bestWeight}</span>
+                    <span className="text-sm">kg</span>
+                  </div>
+                  <div className="text-xs text-[#737373]">Personal Best</div>
+                </div>
+                <div className="w-px h-8 bg-[#1a1a1a]" />
+                <div className="text-center">
+                  <div className="text-xl font-bold text-white number">
+                    {fullHistoryExercise.sessions.length}
+                  </div>
+                  <div className="text-xs text-[#737373]">Total Sessions</div>
+                </div>
+                <div className="w-px h-8 bg-[#1a1a1a]" />
+                <div className="text-center">
+                  <div className="text-xl font-bold text-white number">
+                    {fullHistoryExercise.sessions.reduce((sum, s) => sum + s.sets.length, 0)}
+                  </div>
+                  <div className="text-xs text-[#737373]">Total Sets</div>
+                </div>
+              </div>
+            </div>
+
+            {/* All Sessions List */}
+            <div className="modal-body divide-y divide-[#1a1a1a]">
+              {fullHistoryExercise.sessions.map((session, index) => (
+                <div key={session.date} className="py-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <span className="w-6 h-6 rounded-full bg-[#1a1a1a] flex items-center justify-center text-xs font-medium text-[#737373]">
+                        {index + 1}
+                      </span>
+                      <span className="text-sm font-medium text-white">
+                        {formatDate(session.date)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs text-[#737373]">
+                      <span>
+                        <span className="text-[#f97316] number">{session.topWeight}</span> kg max
+                      </span>
+                      <span>·</span>
+                      <span>
+                        <span className="text-white number">{session.sets.length}</span> sets
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 ml-8">
+                    {session.sets.map((set) => (
+                      <div
+                        key={set.id}
+                        className="bg-[#1a1a1a] rounded px-2 py-1 text-xs"
+                      >
+                        <span className="text-white number">{set.weight}</span>
+                        <span className="text-[#525252]">kg</span>
+                        <span className="text-[#f97316] ml-1">×{set.reps}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Footer */}
+            <div className="modal-footer">
+              <button
+                onClick={() => setFullHistoryExercise(null)}
+                className="btn-secondary w-full"
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>

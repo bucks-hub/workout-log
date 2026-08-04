@@ -193,16 +193,19 @@ export function SetLoggingPanel({ exercise, onClose, onViewProgress }: SetLoggin
     deleteSet(setId);
 
     // Delete from IndexedDB
-    const { deleteLocalSet } = await import('../lib/db');
+    const { deleteLocalSet, addToSyncQueue } = await import('../lib/db');
     await deleteLocalSet(setId);
 
     // Add to sync queue
-    const { addToSyncQueue } = await import('../lib/db');
     await addToSyncQueue({
       action: 'delete',
       table: 'sets',
       payload: { id: setId },
     });
+
+    // Immediately sync to server
+    const { syncToServer } = await import('../lib/sync');
+    syncToServer().catch(console.error);
   };
 
   const handleCustomWeight = () => {

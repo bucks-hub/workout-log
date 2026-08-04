@@ -452,9 +452,51 @@ export async function cleanupOrphanedSyncItems(): Promise<number> {
   return removedCount;
 }
 
+/**
+ * Delete all user data from server and local storage
+ * Used for account deletion
+ */
+export async function deleteAllUserData(): Promise<void> {
+  console.log('Starting user data deletion...');
+
+  // 1. Clear sync queue first
+  await clearSyncQueue();
+  console.log('Cleared sync queue');
+
+  // 2. Clear all IndexedDB stores
+  const db = await getDB();
+  await db.clear('localCategories');
+  await db.clear('localExercises');
+  await db.clear('localSessions');
+  await db.clear('localSets');
+  console.log('Cleared IndexedDB');
+
+  // 3. Delete all data from Supabase (in correct order to respect foreign keys)
+  const { data: { user } } = await supabase.auth.getUser();
+  if (user) {
+    // Delete in reverse dependency order: sets -> sessions -> exercises -> categories
+    const { error: setsError } = await supabase.from('sets').delete().eq('user_id', user.id);
+    if (setsError) console.error('Error deleting sets:', setsError);
+
+    const { error: sessionsError } = await supabase.from('sessions').delete().eq('user_id', user.id);
+    if (sessionsError) console.error('Error deleting sessions:', sessionsError);
+
+    const { error: exercisesError } = await supabase.from('exercises').delete().eq('user_id', user.id);
+    if (exercisesError) console.error('Error deleting exercises:', exercisesError);
+
+    const { error: categoriesError } = await supabase.from('categories').delete().eq('user_id', user.id);
+    if (categoriesError) console.error('Error deleting categories:', categoriesError);
+
+    console.log('Deleted all Supabase data');
+  }
+
+  console.log('User data deletion complete');
+}
+
 // Make cleanup available globally for debugging
 if (typeof window !== 'undefined') {
   (window as any).cleanupAllData = cleanupAllData;
   (window as any).syncToServer = syncToServer;
   (window as any).cleanupOrphanedSyncItems = cleanupOrphanedSyncItems;
+  (window as any).deleteAllUserData = deleteAllUserData;
 }

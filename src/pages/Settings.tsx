@@ -2,10 +2,12 @@ import { useState } from 'react';
 import { useStore } from '../store/useStore';
 import { useAuth } from '../hooks/useAuth';
 import { supabase } from '../lib/supabase';
-import { LogoutIcon, DownloadIcon, UploadIcon, TrashIcon, ChevronRightIcon } from '../components/Icons';
+import { LogoutIcon, DownloadIcon, UploadIcon, TrashIcon, ChevronRightIcon, RefreshIcon } from '../components/Icons';
 import { ImportModal } from '../components/ImportModal';
 import ExcelJS from 'exceljs';
 import { getExportFilename } from '../utils/date';
+import { deleteAllUserData, syncToServer } from '../lib/sync';
+import { getSyncQueue } from '../lib/db';
 
 // Color palette matching the app theme
 const COLORS = {
@@ -27,10 +29,30 @@ const COLORS = {
 export function Settings() {
   const { user } = useStore();
   const { signOut } = useAuth();
-  const { categories, exercises, pendingSyncCount } = useStore();
+  const {
+    categories,
+    exercises,
+    pendingSyncCount,
+    setPendingSyncCount,
+    syncStatus,
+    setSyncStatus,
+    lastSyncTime,
+    setLastSyncTime,
+    setSyncError,
+    setCategories,
+    setExercises,
+    setCurrentSession,
+    setCurrentSets,
+  } = useStore();
   const [exporting, setExporting] = useState(false);
   const [showDeleteAccount, setShowDeleteAccount] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showExportOptions, setShowExportOptions] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [showCategoryDetails, setShowCategoryDetails] = useState(false);
+  const [showExerciseDetails, setShowExerciseDetails] = useState(false);
 
   const handleExport = async () => {
     if (!user) return;
@@ -565,6 +587,138 @@ export function Settings() {
       alert('Failed to export data');
     } finally {
       setExporting(false);
+      setShowExportOptions(false);
+    }
+  };
+
+  const handleExportSimple = async () => {
+    if (!user) return;
+
+    setExporting(true);
+    try {
+      // Load all data
+      const { data: sessions } = await supabase
+        .from('sessions')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('date', { ascending: false });
+
+      const { data: sets } = await supabase
+        .from('sets')
+        .select('*')
+        .eq('user_id', user.id);
+
+      if (!sessions || !sets) {
+        alert('Failed to load data for export');
+        return;
+      }
+
+      // Create workbook
+      const workbook = new ExcelJS.Workbook();
+      workbook.creator = 'Workout Log';
+      workbook.created = new Date();
+
+      const sheet = workbook.addWorksheet('Workouts');
+
+      // Add headers
+      const headerRow = sheet.addRow(['Date', 'Category', 'Exercise', 'Weight', 'Reps', 'Sets']);
+      headerRow.font = { bold: true };
+      headerRow.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF' + COLORS.orange },
+      };
+      headerRow.eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      });
+
+      // Set column widths
+      sheet.getColumn(1).width = 12;
+      sheet.getColumn(2).width = 18;
+      sheet.getColumn(3).width = 25;
+      sheet.getColumn(4).width = 10;
+      sheet.getColumn(5).width = 8;
+      sheet.getColumn(6).width = 8;
+
+      // Group sets by session and exercise
+      const workoutMap = new Map<string, { date: string; category: string; exercise: string; weight: number; reps: number; setCount: number }>();
+
+      for (const set of sets) {
+        const session = sessions.find(s => s.id === set.session_id);
+        const exercise = exercises.find(e => e.id === set.exercise_id);
+        const category = categories.find(c => c.id === exercise?.category_id);
+
+        if (!session || !exercise) continue;
+
+        const key = `${session.date}__${exercise.id}`;
+        const existing = workoutMap.get(key);
+
+        if (existing) {
+          // Update with heaviest weight
+          if (set.weight > existing.weight) {
+            existing.weight = set.weight;
+            existing.reps = set.reps;
+          }
+          existing.setCount++;
+        } else {
+          workoutMap.set(key, {
+            date: session.date,
+            category: category?.name || 'Uncategorized',
+            exercise: exercise.name,
+            weight: set.weight,
+            reps: set.reps,
+            setCount: 1,
+          });
+        }
+      }
+
+      // Sort by date descending, then by category, then by exercise
+      const sortedWorkouts = Array.from(workoutMap.values()).sort((a, b) => {
+        const dateCompare = b.date.localeCompare(a.date);
+        if (dateCompare !== 0) return dateCompare;
+        const catCompare = a.category.localeCompare(b.category);
+        if (catCompare !== 0) return catCompare;
+        return a.exercise.localeCompare(b.exercise);
+      });
+
+      // Add data rows
+      let rowIndex = 2;
+      for (const workout of sortedWorkouts) {
+        const row = sheet.addRow([
+          workout.date,
+          workout.category,
+          workout.exercise,
+          workout.weight,
+          workout.reps,
+          workout.setCount,
+        ]);
+
+        const rowColor = rowIndex % 2 === 0 ? COLORS.white : COLORS.grayLight;
+        row.eachCell((cell, colNumber) => {
+          cell.font = { size: 10 };
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + rowColor } };
+          cell.alignment = { horizontal: colNumber <= 3 ? 'left' : 'center', vertical: 'middle' };
+        });
+        rowIndex++;
+      }
+
+      // Generate buffer and download
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `workout-log-simple-${new Date().toISOString().split('T')[0]}.xlsx`;
+      link.click();
+      URL.revokeObjectURL(url);
+
+    } catch (error) {
+      console.error('Export error:', error);
+      alert('Failed to export data');
+    } finally {
+      setExporting(false);
+      setShowExportOptions(false);
     }
   };
 
@@ -577,10 +731,70 @@ export function Settings() {
   };
 
   const handleDeleteAccount = async () => {
-    // This would need server-side implementation
-    alert('Account deletion requires contacting support.');
-    setShowDeleteAccount(false);
+    if (deleteConfirmText !== 'DELETE') return;
+
+    setIsDeleting(true);
+    try {
+      // Delete all user data from Supabase and IndexedDB
+      await deleteAllUserData();
+
+      // Clear local state
+      setCategories([]);
+      setExercises([]);
+      setCurrentSession(null);
+      setCurrentSets([]);
+      setPendingSyncCount(0);
+
+      // Sign out the user
+      await signOut();
+    } catch (error) {
+      console.error('Delete account error:', error);
+      alert('Failed to delete account. Please try again.');
+    } finally {
+      setIsDeleting(false);
+      setShowDeleteAccount(false);
+      setDeleteConfirmText('');
+    }
   };
+
+  const handleManualSync = async () => {
+    if (isSyncing) return;
+
+    setIsSyncing(true);
+    setSyncStatus('syncing');
+    setSyncError(null);
+
+    try {
+      await syncToServer();
+      const queue = await getSyncQueue();
+      setPendingSyncCount(queue.length);
+      setSyncStatus('success');
+      setLastSyncTime(Date.now());
+    } catch (error: any) {
+      console.error('Sync error:', error);
+      setSyncStatus('error');
+      setSyncError(error.message || 'Sync failed');
+    } finally {
+      setIsSyncing(false);
+      // Reset status to idle after a short delay
+      setTimeout(() => setSyncStatus('idle'), 2000);
+    }
+  };
+
+  const formatLastSyncTime = () => {
+    if (!lastSyncTime) return 'Never';
+    const diff = Date.now() - lastSyncTime;
+    if (diff < 60000) return 'Just now';
+    if (diff < 3600000) return `${Math.floor(diff / 60000)} min ago`;
+    if (diff < 86400000) return `${Math.floor(diff / 3600000)} hours ago`;
+    return new Date(lastSyncTime).toLocaleDateString();
+  };
+
+  // Group exercises by category for details view
+  const exercisesByCategory = categories.map((cat) => ({
+    category: cat,
+    exercises: exercises.filter((ex) => ex.category_id === cat.id),
+  }));
 
   return (
     <div className="page">
@@ -626,16 +840,15 @@ export function Settings() {
               <div className="flex items-center gap-3 text-white">
                 <UploadIcon className="w-5 h-5 text-[#22c55e]" />
                 <div>
-                  <span className="font-medium">Import from Excel</span>
-                  <p className="text-sm text-[#737373]">AI-powered import from any format</p>
+                  <span className="font-medium">Import Workouts</span>
+                  <p className="text-sm text-[#737373]">Free Excel/CSV or AI-powered import</p>
                 </div>
               </div>
               <ChevronRightIcon className="w-5 h-5 text-[#525252]" />
             </button>
             <button
-              onClick={handleExport}
-              disabled={exporting}
-              className="w-full p-4 flex items-center justify-between text-left hover:bg-[#111] transition-colors disabled:opacity-50"
+              onClick={() => setShowExportOptions(true)}
+              className="w-full p-4 flex items-center justify-between text-left hover:bg-[#111] transition-colors"
             >
               <div className="flex items-center gap-3 text-white">
                 <DownloadIcon className="w-5 h-5 text-[#f97316]" />
@@ -649,20 +862,64 @@ export function Settings() {
           </div>
         </div>
 
+        {/* Sync Section */}
+        <div>
+          <h2 className="text-xs font-semibold text-[#737373] uppercase tracking-wider mb-3 px-1">
+            Sync
+          </h2>
+          <div className="card divide-y divide-[#1a1a1a]">
+            <button
+              onClick={handleManualSync}
+              disabled={isSyncing}
+              className="w-full p-4 flex items-center justify-between text-left hover:bg-[#111] transition-colors disabled:opacity-50"
+            >
+              <div className="flex items-center gap-3 text-white">
+                <RefreshIcon className={`w-5 h-5 text-[#3b82f6] ${isSyncing ? 'animate-spin' : ''}`} />
+                <div>
+                  <span className="font-medium">Sync Now</span>
+                  <p className="text-sm text-[#737373]">
+                    {syncStatus === 'syncing' ? 'Syncing...' :
+                     syncStatus === 'success' ? 'Sync complete!' :
+                     syncStatus === 'error' ? 'Sync failed' :
+                     `Last sync: ${formatLastSyncTime()}`}
+                  </p>
+                </div>
+              </div>
+              {pendingSyncCount > 0 && (
+                <span className="bg-[#f97316]/10 text-[#f97316] px-2 py-1 rounded-full text-sm font-medium number">
+                  {pendingSyncCount} pending
+                </span>
+              )}
+            </button>
+          </div>
+        </div>
+
         {/* Stats Section */}
         <div>
           <h2 className="text-xs font-semibold text-[#737373] uppercase tracking-wider mb-3 px-1">
             Statistics
           </h2>
           <div className="card divide-y divide-[#1a1a1a]">
-            <div className="p-4 flex items-center justify-between">
+            <button
+              onClick={() => setShowCategoryDetails(true)}
+              className="w-full p-4 flex items-center justify-between text-left hover:bg-[#111] transition-colors"
+            >
               <span className="text-[#a3a3a3]">Categories</span>
-              <span className="text-white font-medium number">{categories.length}</span>
-            </div>
-            <div className="p-4 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-white font-medium number">{categories.length}</span>
+                <ChevronRightIcon className="w-4 h-4 text-[#525252]" />
+              </div>
+            </button>
+            <button
+              onClick={() => setShowExerciseDetails(true)}
+              className="w-full p-4 flex items-center justify-between text-left hover:bg-[#111] transition-colors"
+            >
               <span className="text-[#a3a3a3]">Exercises</span>
-              <span className="text-white font-medium number">{exercises.length}</span>
-            </div>
+              <div className="flex items-center gap-2">
+                <span className="text-white font-medium number">{exercises.length}</span>
+                <ChevronRightIcon className="w-4 h-4 text-[#525252]" />
+              </div>
+            </button>
             <div className="p-4 flex items-center justify-between">
               <span className="text-[#a3a3a3]">Pending Sync</span>
               <span className={`font-medium number ${pendingSyncCount > 0 ? 'text-[#f97316]' : 'text-white'}`}>
@@ -702,21 +959,193 @@ export function Settings() {
 
       {/* Delete Account Confirmation */}
       {showDeleteAccount && (
-        <div className="modal-backdrop" onClick={() => setShowDeleteAccount(false)}>
+        <div className="modal-backdrop" onClick={() => { setShowDeleteAccount(false); setDeleteConfirmText(''); }}>
           <div className="modal-content max-w-sm mx-4" onClick={(e) => e.stopPropagation()}>
             <div className="p-4 space-y-4">
               <h3 className="text-lg font-semibold text-white">Delete Account?</h3>
               <p className="text-[#a3a3a3]">
-                This will permanently delete your account and all your workout data. This action cannot be undone.
+                This will permanently delete your account and all your workout data including:
               </p>
+              <ul className="text-sm text-[#737373] list-disc list-inside space-y-1">
+                <li>{categories.length} categories</li>
+                <li>{exercises.length} exercises</li>
+                <li>All workout sessions and sets</li>
+              </ul>
+              <p className="text-[#ef4444] text-sm font-medium">
+                This action cannot be undone.
+              </p>
+              <div className="space-y-2">
+                <label className="text-sm text-[#a3a3a3]">
+                  Type <strong className="text-white">DELETE</strong> to confirm:
+                </label>
+                <input
+                  type="text"
+                  value={deleteConfirmText}
+                  onChange={(e) => setDeleteConfirmText(e.target.value)}
+                  placeholder="DELETE"
+                  className="input"
+                  autoComplete="off"
+                />
+              </div>
               <div className="flex gap-2">
-                <button onClick={handleDeleteAccount} className="btn-danger flex-1">
-                  Delete Account
+                <button
+                  onClick={handleDeleteAccount}
+                  disabled={deleteConfirmText !== 'DELETE' || isDeleting}
+                  className="btn-danger flex-1"
+                >
+                  {isDeleting ? 'Deleting...' : 'Delete Account'}
                 </button>
-                <button onClick={() => setShowDeleteAccount(false)} className="btn-secondary flex-1">
+                <button
+                  onClick={() => { setShowDeleteAccount(false); setDeleteConfirmText(''); }}
+                  disabled={isDeleting}
+                  className="btn-secondary flex-1"
+                >
                   Cancel
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Category Details Modal */}
+      {showCategoryDetails && (
+        <div className="modal-backdrop" onClick={() => setShowCategoryDetails(false)}>
+          <div className="modal-content max-w-sm mx-4" onClick={(e) => e.stopPropagation()}>
+            <div className="p-4 space-y-4">
+              <h3 className="text-lg font-semibold text-white">Categories ({categories.length})</h3>
+              {categories.length === 0 ? (
+                <p className="text-[#737373]">No categories yet</p>
+              ) : (
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {categories
+                    .sort((a, b) => a.sort_order - b.sort_order)
+                    .map((cat) => {
+                      const exerciseCount = exercises.filter((ex) => ex.category_id === cat.id).length;
+                      return (
+                        <div key={cat.id} className="p-3 bg-[#1a1a1a] rounded-xl flex items-center justify-between">
+                          <span className="text-white">{cat.name}</span>
+                          <span className="text-sm text-[#737373] number">{exerciseCount} exercises</span>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+              <button onClick={() => setShowCategoryDetails(false)} className="btn-secondary w-full">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Exercise Details Modal */}
+      {showExerciseDetails && (
+        <div className="modal-backdrop" onClick={() => setShowExerciseDetails(false)}>
+          <div className="modal-content max-w-sm mx-4" onClick={(e) => e.stopPropagation()}>
+            <div className="p-4 space-y-4">
+              <h3 className="text-lg font-semibold text-white">Exercises ({exercises.length})</h3>
+              {exercises.length === 0 ? (
+                <p className="text-[#737373]">No exercises yet</p>
+              ) : (
+                <div className="space-y-4 max-h-60 overflow-y-auto">
+                  {exercisesByCategory
+                    .filter((group) => group.exercises.length > 0)
+                    .map(({ category, exercises: catExercises }) => (
+                      <div key={category.id}>
+                        <h4 className="text-xs font-semibold text-[#737373] uppercase tracking-wider mb-2">
+                          {category.name}
+                        </h4>
+                        <div className="space-y-1">
+                          {catExercises
+                            .sort((a, b) => a.sort_order - b.sort_order)
+                            .map((ex) => (
+                              <div key={ex.id} className="p-2 bg-[#1a1a1a] rounded-lg text-white text-sm">
+                                {ex.name}
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
+              <button onClick={() => setShowExerciseDetails(false)} className="btn-secondary w-full">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Export Format Options Modal */}
+      {showExportOptions && (
+        <div className="modal-backdrop" onClick={() => setShowExportOptions(false)}>
+          <div className="modal-content max-w-sm mx-4" onClick={(e) => e.stopPropagation()}>
+            <div className="p-4 space-y-4">
+              <h3 className="text-lg font-semibold text-white">Export Format</h3>
+              <p className="text-sm text-[#737373]">Choose how you want to export your workout data:</p>
+
+              <div className="space-y-3">
+                <button
+                  onClick={handleExport}
+                  disabled={exporting}
+                  className="w-full p-4 bg-[#1a1a1a] rounded-xl border border-[#333] hover:border-[#f97316] transition-colors text-left disabled:opacity-50"
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-white">Detailed Format</span>
+                    <span className="text-xs bg-[#f97316]/10 text-[#f97316] px-2 py-0.5 rounded">3 sheets</span>
+                  </div>
+                  <p className="text-xs text-[#737373]">
+                    Gym log grid with categories, progress summary, and detailed sets. Best for analysis.
+                  </p>
+                </button>
+
+                <button
+                  onClick={handleExportSimple}
+                  disabled={exporting}
+                  className="w-full p-4 bg-[#1a1a1a] rounded-xl border border-[#333] hover:border-[#f97316] transition-colors text-left disabled:opacity-50"
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-white">Simple Format</span>
+                    <span className="text-xs bg-[#22c55e]/10 text-[#22c55e] px-2 py-0.5 rounded">Re-importable</span>
+                  </div>
+                  <p className="text-xs text-[#737373]">
+                    Simple table with Date, Category, Exercise, Weight, Reps, Sets. Can be imported back.
+                  </p>
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="w-full text-xs border border-[#333] rounded">
+                      <thead>
+                        <tr className="bg-[#262626]">
+                          <th className="px-1 py-0.5 text-[#737373]">Date</th>
+                          <th className="px-1 py-0.5 text-[#737373]">Category</th>
+                          <th className="px-1 py-0.5 text-[#737373]">Exercise</th>
+                          <th className="px-1 py-0.5 text-[#737373]">Weight</th>
+                          <th className="px-1 py-0.5 text-[#737373]">Reps</th>
+                          <th className="px-1 py-0.5 text-[#737373]">Sets</th>
+                        </tr>
+                      </thead>
+                    </table>
+                  </div>
+                </button>
+              </div>
+
+              {exporting && (
+                <div className="flex items-center justify-center gap-2 text-[#f97316]">
+                  <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                  </svg>
+                  <span className="text-sm">Exporting...</span>
+                </div>
+              )}
+
+              <button
+                onClick={() => setShowExportOptions(false)}
+                disabled={exporting}
+                className="btn-secondary w-full"
+              >
+                Cancel
+              </button>
             </div>
           </div>
         </div>

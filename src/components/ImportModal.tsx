@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from 'react';
 import { useStore } from '../store/useStore';
-import { CloseIcon, UploadIcon, KeyIcon, SparklesIcon, EyeIcon, EyeSlashIcon, CheckIcon, TrashIcon, PlusIcon } from './Icons';
+import { CloseIcon, UploadIcon, DownloadIcon, KeyIcon, SparklesIcon, EyeIcon, EyeSlashIcon, CheckIcon, TrashIcon, PlusIcon, TableCellsIcon } from './Icons';
 import ExcelJS from 'exceljs';
 import { v4 as uuidv4 } from 'uuid';
 import { createCategory, createExercise, upsertSession, createSet, syncToServer } from '../lib/sync';
@@ -31,9 +31,30 @@ interface UploadedFile {
   name: string;
   type: 'excel' | 'image';
   data: string; // base64 for images, text for excel
+  rawData?: any[][]; // For manual import - parsed rows
   status: 'pending' | 'processing' | 'done' | 'error';
   error?: string;
 }
+
+// Column mapping for manual import
+interface ColumnMapping {
+  date: number | null;
+  category: number | null;
+  exercise: number | null;
+  weight: number | null;
+  reps: number | null;
+  sets: number | null;
+}
+
+// Common header patterns for auto-detection
+const HEADER_PATTERNS: Record<keyof ColumnMapping, string[]> = {
+  date: ['date', 'workout date', 'day', 'when', 'timestamp'],
+  category: ['category', 'muscle', 'muscle group', 'group', 'body part', 'type'],
+  exercise: ['exercise', 'movement', 'workout', 'name', 'exercise name', 'lift'],
+  weight: ['weight', 'kg', 'lbs', 'load', 'resistance', 'weight (kg)', 'weight (lbs)'],
+  reps: ['reps', 'repetitions', 'rep', 'count', 'times'],
+  sets: ['sets', 'set', 'set count', 'num sets'],
+};
 
 // API key storage
 const API_KEY_STORAGE = 'workout_log_anthropic_api_key';
@@ -53,13 +74,15 @@ function setStoredApiKey(key: string): void {
 export function ImportModal({ onClose }: ImportModalProps) {
   const { user, categories, exercises, addCategory, addExercise } = useStore();
 
-  // If API key is already stored, start at upload step
+  // Start at mode selection
+  const [step, setStep] = useState<'mode' | 'config' | 'upload' | 'mapping' | 'parsing' | 'preview' | 'importing' | 'done'>('mode');
+  const [importMode, setImportMode] = useState<'manual' | 'ai' | null>(null);
+
+  // API key for AI mode
   const storedKey = getStoredApiKey();
-  const [step, setStep] = useState<'config' | 'upload' | 'parsing' | 'preview' | 'importing' | 'done'>(
-    storedKey ? 'upload' : 'config'
-  );
   const [apiKey, setApiKey] = useState(storedKey);
   const [showApiKey, setShowApiKey] = useState(false);
+
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [importProgress, setImportProgress] = useState({ current: 0, total: 0 });
@@ -67,6 +90,20 @@ export function ImportModal({ onClose }: ImportModalProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [debugInfo, setDebugInfo] = useState<string>('');
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+
+  // Manual import state
+  const [columnMapping, setColumnMapping] = useState<ColumnMapping>({
+    date: null,
+    category: null,
+    exercise: null,
+    weight: null,
+    reps: null,
+    sets: null,
+  });
+  const [headers, setHeaders] = useState<string[]>([]);
+  const [previewRows, setPreviewRows] = useState<any[][]>([]);
+  const [allRows, setAllRows] = useState<any[][]>([]);
+  const [defaultCategory, setDefaultCategory] = useState('Uncategorized');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -84,12 +121,86 @@ export function ImportModal({ onClose }: ImportModalProps) {
     setStep('upload');
   };
 
-  const processExcelFile = async (file: File): Promise<string> => {
+  const handleSelectMode = (mode: 'manual' | 'ai') => {
+    setImportMode(mode);
+    setError(null);
+    if (mode === 'manual') {
+      setStep('upload');
+    } else {
+      // AI mode - check for API key
+      if (storedKey) {
+        setStep('upload');
+      } else {
+        setStep('config');
+      }
+    }
+  };
+
+  const downloadTemplate = async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Workouts');
+
+    // Add headers
+    sheet.addRow(['Date', 'Category', 'Exercise', 'Weight', 'Reps', 'Sets']);
+
+    // Add sample data
+    sheet.addRow(['2024-01-15', 'Chest', 'Bench Press', 60, 10, 3]);
+    sheet.addRow(['2024-01-15', 'Chest', 'Incline Dumbbell Press', 20, 12, 3]);
+    sheet.addRow(['2024-01-15', 'Back', 'Lat Pulldown', 45, 10, 3]);
+    sheet.addRow(['2024-01-17', 'Legs', 'Squat', 80, 8, 4]);
+    sheet.addRow(['2024-01-17', 'Legs', 'Leg Press', 120, 12, 3]);
+
+    // Style headers
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true };
+    headerRow.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFF97316' },
+    };
+    headerRow.eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    });
+
+    // Set column widths
+    sheet.getColumn(1).width = 12;
+    sheet.getColumn(2).width = 15;
+    sheet.getColumn(3).width = 25;
+    sheet.getColumn(4).width = 10;
+    sheet.getColumn(5).width = 8;
+    sheet.getColumn(6).width = 8;
+
+    // Generate and download
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'workout-import-template.xlsx';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleManualPreview = () => {
+    if (!columnMapping.exercise) {
+      setError('Please map at least the Exercise column');
+      return;
+    }
+    setError(null);
+    const parsedPreview = parseRowsToWorkouts(allRows, columnMapping, defaultCategory);
+    setPreview(parsedPreview);
+    setSelectedWorkouts(new Set(parsedPreview.workouts.map((_, i) => i)));
+    setStep('preview');
+  };
+
+  const processExcelFile = async (file: File): Promise<{ text: string; rows: any[][] }> => {
     const buffer = await file.arrayBuffer();
     const workbook = new ExcelJS.Workbook();
     await workbook.xlsx.load(buffer);
 
     let excelText = '';
+    const rows: any[][] = [];
+
     workbook.eachSheet((sheet, sheetId) => {
       excelText += `\n=== Sheet ${sheetId}: ${sheet.name} ===\n`;
       sheet.eachRow((row, rowNum) => {
@@ -104,10 +215,131 @@ export function ImportModal({ onClose }: ImportModalProps) {
           return String(v);
         });
         excelText += `Row ${rowNum}: ${rowData.join(' | ')}\n`;
+        rows.push(rowData);
       });
     });
 
-    return excelText;
+    return { text: excelText, rows };
+  };
+
+  // Auto-detect column mapping from headers
+  const autoDetectColumns = (headerRow: string[]): ColumnMapping => {
+    const mapping: ColumnMapping = {
+      date: null,
+      category: null,
+      exercise: null,
+      weight: null,
+      reps: null,
+      sets: null,
+    };
+
+    headerRow.forEach((header, index) => {
+      const normalized = header.toLowerCase().trim();
+      for (const [key, patterns] of Object.entries(HEADER_PATTERNS)) {
+        if (patterns.some(p => normalized.includes(p) || p.includes(normalized))) {
+          if (mapping[key as keyof ColumnMapping] === null) {
+            mapping[key as keyof ColumnMapping] = index;
+          }
+        }
+      }
+    });
+
+    return mapping;
+  };
+
+  // Parse date from various formats
+  const parseDate = (value: any): string => {
+    if (!value) return new Date().toISOString().split('T')[0];
+
+    // Already in YYYY-MM-DD format
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return value;
+    }
+
+    // Excel date serial number
+    if (typeof value === 'number') {
+      const date = new Date((value - 25569) * 86400 * 1000);
+      return date.toISOString().split('T')[0];
+    }
+
+    // Try parsing various date formats
+    try {
+      const date = new Date(value);
+      if (!isNaN(date.getTime())) {
+        return date.toISOString().split('T')[0];
+      }
+    } catch {
+      // Fall through
+    }
+
+    // DD/MM/YYYY or MM/DD/YYYY
+    const parts = String(value).split(/[\/\-\.]/);
+    if (parts.length === 3) {
+      const [p1, p2, p3] = parts.map(p => parseInt(p, 10));
+      // Assume DD/MM/YYYY if first part <= 31 and second <= 12
+      if (p1 <= 31 && p2 <= 12) {
+        const year = p3 < 100 ? 2000 + p3 : p3;
+        return `${year}-${String(p2).padStart(2, '0')}-${String(p1).padStart(2, '0')}`;
+      }
+      // MM/DD/YYYY
+      if (p1 <= 12 && p2 <= 31) {
+        const year = p3 < 100 ? 2000 + p3 : p3;
+        return `${year}-${String(p1).padStart(2, '0')}-${String(p2).padStart(2, '0')}`;
+      }
+    }
+
+    return new Date().toISOString().split('T')[0];
+  };
+
+  // Parse rows into workouts using column mapping
+  const parseRowsToWorkouts = (rows: any[][], mapping: ColumnMapping, defaultCat: string): ImportPreview => {
+    const categoriesSet = new Set<string>();
+    const exercisesMap = new Map<string, { name: string; category: string }>();
+    const workoutsMap = new Map<string, ParsedWorkout>();
+
+    // Skip header row
+    const dataRows = rows.slice(1);
+
+    for (const row of dataRows) {
+      const date = mapping.date !== null ? parseDate(row[mapping.date]) : new Date().toISOString().split('T')[0];
+      const category = mapping.category !== null ? String(row[mapping.category] || defaultCat).trim() : defaultCat;
+      const exercise = mapping.exercise !== null ? String(row[mapping.exercise] || '').trim() : '';
+      const weight = mapping.weight !== null ? parseFloat(row[mapping.weight]) || 0 : 0;
+      const reps = mapping.reps !== null ? parseInt(row[mapping.reps], 10) || 0 : 0;
+      const setsCount = mapping.sets !== null ? parseInt(row[mapping.sets], 10) || 1 : 1;
+
+      if (!exercise) continue;
+
+      categoriesSet.add(category);
+      const exerciseKey = `${exercise}__${category}`;
+      if (!exercisesMap.has(exerciseKey)) {
+        exercisesMap.set(exerciseKey, { name: exercise, category });
+      }
+
+      const workoutKey = `${date}__${exercise}__${category}`;
+      if (!workoutsMap.has(workoutKey)) {
+        workoutsMap.set(workoutKey, {
+          date,
+          category,
+          exercise,
+          sets: [],
+        });
+      }
+
+      const workout = workoutsMap.get(workoutKey)!;
+      // Add sets based on setsCount
+      for (let i = 0; i < setsCount; i++) {
+        workout.sets.push({ weight, reps });
+      }
+    }
+
+    const workouts = Array.from(workoutsMap.values());
+    return {
+      categories: Array.from(categoriesSet),
+      exercises: Array.from(exercisesMap.values()),
+      workouts,
+      totalSets: workouts.reduce((sum, w) => sum + w.sets.length, 0),
+    };
   };
 
   const processImageFile = async (file: File): Promise<string> => {
@@ -133,6 +365,12 @@ export function ImportModal({ onClose }: ImportModalProps) {
       return;
     }
 
+    // For manual mode, only accept Excel files
+    if (importMode === 'manual' && isImage) {
+      setError('Manual import only supports Excel/CSV files. Use AI import for images.');
+      return;
+    }
+
     const newFile: UploadedFile = {
       id: uuidv4(),
       name: file.name,
@@ -144,22 +382,34 @@ export function ImportModal({ onClose }: ImportModalProps) {
     setUploadedFiles(prev => [...prev, newFile]);
 
     try {
-      let data: string;
       if (isImage) {
-        data = await processImageFile(file);
+        const data = await processImageFile(file);
+        setUploadedFiles(prev =>
+          prev.map(f => f.id === newFile.id ? { ...f, data, status: 'done' } : f)
+        );
       } else {
-        data = await processExcelFile(file);
-      }
+        const { text, rows } = await processExcelFile(file);
+        setUploadedFiles(prev =>
+          prev.map(f => f.id === newFile.id ? { ...f, data: text, rawData: rows, status: 'done' } : f)
+        );
 
-      setUploadedFiles(prev =>
-        prev.map(f => f.id === newFile.id ? { ...f, data, status: 'done' } : f)
-      );
+        // For manual mode, set up column mapping
+        if (importMode === 'manual' && rows.length > 0) {
+          const headerRow = rows[0].map(v => String(v));
+          setHeaders(headerRow);
+          setPreviewRows(rows.slice(1, 6)); // Show first 5 data rows
+          setAllRows(rows);
+          const detected = autoDetectColumns(headerRow);
+          setColumnMapping(detected);
+          setStep('mapping');
+        }
+      }
     } catch (err: any) {
       setUploadedFiles(prev =>
         prev.map(f => f.id === newFile.id ? { ...f, status: 'error', error: err.message } : f)
       );
     }
-  }, []);
+  }, [importMode]);
 
   const removeFile = (fileId: string) => {
     setUploadedFiles(prev => prev.filter(f => f.id !== fileId));
@@ -620,6 +870,67 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
             </div>
           )}
 
+          {/* Step 0: Mode Selection */}
+          {step === 'mode' && (
+            <div className="space-y-4">
+              <p className="text-[#a3a3a3] text-sm">
+                Choose how you want to import your workout data:
+              </p>
+
+              <button
+                onClick={() => handleSelectMode('manual')}
+                className="w-full p-4 bg-[#1a1a1a] rounded-xl border border-[#333] hover:border-[#f97316] transition-colors text-left"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-[#22c55e]/10 rounded-lg flex items-center justify-center">
+                    <TableCellsIcon className="w-6 h-6 text-[#22c55e]" />
+                  </div>
+                  <div>
+                    <div className="font-medium text-white">Excel/CSV Import</div>
+                    <div className="text-sm text-[#737373]">Free - No API key required</div>
+                  </div>
+                  <div className="ml-auto">
+                    <span className="bg-[#22c55e]/10 text-[#22c55e] text-xs font-semibold px-2 py-1 rounded-full">
+                      FREE
+                    </span>
+                  </div>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1">
+                  <span className="text-xs bg-[#262626] text-[#737373] px-2 py-0.5 rounded">.xlsx</span>
+                  <span className="text-xs bg-[#262626] text-[#737373] px-2 py-0.5 rounded">.xls</span>
+                  <span className="text-xs bg-[#262626] text-[#737373] px-2 py-0.5 rounded">.csv</span>
+                </div>
+                <p className="text-xs text-[#525252] mt-1">
+                  Map columns manually with template guide
+                </p>
+              </button>
+
+              <button
+                onClick={() => handleSelectMode('ai')}
+                className="w-full p-4 bg-[#1a1a1a] rounded-xl border border-[#333] hover:border-[#f97316] transition-colors text-left"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-[#f97316]/10 rounded-lg flex items-center justify-center">
+                    <SparklesIcon className="w-6 h-6 text-[#f97316]" />
+                  </div>
+                  <div>
+                    <div className="font-medium text-white">AI-Powered Import</div>
+                    <div className="text-sm text-[#737373]">Requires Anthropic API key</div>
+                  </div>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1">
+                  <span className="text-xs bg-[#262626] text-[#737373] px-2 py-0.5 rounded">.xlsx</span>
+                  <span className="text-xs bg-[#262626] text-[#737373] px-2 py-0.5 rounded">.png</span>
+                  <span className="text-xs bg-[#262626] text-[#737373] px-2 py-0.5 rounded">.jpg</span>
+                  <span className="text-xs bg-[#262626] text-[#525252] px-2 py-0.5 rounded">any format</span>
+                </div>
+                <p className="text-xs text-[#525252] mt-1">
+                  Auto-extracts from any layout including photos of handwritten logs
+                </p>
+              </button>
+            </div>
+          )}
+
           {/* Step 1: API Key Configuration */}
           {step === 'config' && (
             <div className="space-y-4">
@@ -685,18 +996,22 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
                   {isDragging ? 'Drop files here' : 'Click to upload or drag & drop'}
                 </p>
                 <p className="text-sm text-[#737373] mt-1">
-                  Excel (.xlsx, .xls) or Images (.png, .jpg)
+                  {importMode === 'manual'
+                    ? 'Excel (.xlsx, .xls) or CSV files only'
+                    : 'Excel (.xlsx, .xls) or Images (.png, .jpg)'}
                 </p>
-                <p className="text-xs text-[#525252] mt-1">
-                  Upload multiple files to combine data
-                </p>
+                {importMode === 'ai' && (
+                  <p className="text-xs text-[#525252] mt-1">
+                    Upload multiple files to combine data
+                  </p>
+                )}
               </div>
 
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".xlsx,.xls,.csv,image/*"
-                multiple
+                accept={importMode === 'manual' ? '.xlsx,.xls,.csv' : '.xlsx,.xls,.csv,image/*'}
+                multiple={importMode === 'ai'}
                 onChange={handleFileSelect}
                 className="hidden"
               />
@@ -749,29 +1064,255 @@ IMPORTANT: Return ONLY the raw JSON object. Do NOT wrap it in markdown code bloc
                 </div>
               )}
 
-              <div className="p-4 bg-[#1a1a1a] rounded-xl space-y-2">
-                <p className="text-sm font-medium text-white">How it works:</p>
-                <ol className="text-sm text-[#737373] space-y-1 list-decimal list-inside">
-                  <li>Upload Excel files or images of workout logs</li>
-                  <li>AI analyzes each file separately</li>
-                  <li>Data is combined and deduplicated</li>
-                  <li>Review and import selected entries</li>
-                </ol>
-                <p className="text-xs text-[#525252] mt-2">
-                  Names are preserved exactly as you wrote them
-                </p>
+              {importMode === 'ai' ? (
+                <>
+                  <div className="p-4 bg-[#1a1a1a] rounded-xl space-y-2">
+                    <p className="text-sm font-medium text-white">How it works:</p>
+                    <ol className="text-sm text-[#737373] space-y-1 list-decimal list-inside">
+                      <li>Upload Excel files or images of workout logs</li>
+                      <li>AI analyzes each file separately</li>
+                      <li>Data is combined and deduplicated</li>
+                      <li>Review and import selected entries</li>
+                    </ol>
+                    <p className="text-xs text-[#525252] mt-2">
+                      Names are preserved exactly as you wrote them
+                    </p>
+                  </div>
+
+                  <div className="flex gap-2">
+                    <button onClick={() => setStep('config')} className="btn-secondary flex-1">
+                      Change API Key
+                    </button>
+                    <button
+                      onClick={processAllFiles}
+                      disabled={readyFilesCount === 0}
+                      className="btn-primary flex-1"
+                    >
+                      Process {readyFilesCount} file{readyFilesCount !== 1 ? 's' : ''}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  {/* Template Format Guide */}
+                  <div className="p-4 bg-[#1a1a1a] rounded-xl space-y-3">
+                    <p className="text-sm font-medium text-white">Required Excel Format</p>
+                    <p className="text-xs text-[#737373]">
+                      Your file should have a header row with these columns:
+                    </p>
+
+                    {/* Format table */}
+                    <div className="overflow-x-auto rounded-lg border border-[#333]">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="bg-[#f97316]/20">
+                            <th className="px-2 py-1.5 text-left text-[#f97316] font-semibold">Date</th>
+                            <th className="px-2 py-1.5 text-left text-[#f97316] font-semibold">Category</th>
+                            <th className="px-2 py-1.5 text-left text-[#f97316] font-semibold">Exercise</th>
+                            <th className="px-2 py-1.5 text-left text-[#f97316] font-semibold">Weight</th>
+                            <th className="px-2 py-1.5 text-left text-[#f97316] font-semibold">Reps</th>
+                            <th className="px-2 py-1.5 text-left text-[#f97316] font-semibold">Sets</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr className="border-t border-[#333]">
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">2024-01-15</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">Chest</td>
+                            <td className="px-2 py-1.5 text-white">Bench Press</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">60</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">10</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">3</td>
+                          </tr>
+                          <tr className="border-t border-[#333]">
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">2024-01-15</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">Legs</td>
+                            <td className="px-2 py-1.5 text-white">Squat</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">80</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">8</td>
+                            <td className="px-2 py-1.5 text-[#a3a3a3]">4</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="space-y-1 text-xs text-[#525252]">
+                      <p><span className="text-white">Exercise</span> - Required (exercise name)</p>
+                      <p><span className="text-[#737373]">Date</span> - Optional (defaults to today)</p>
+                      <p><span className="text-[#737373]">Category</span> - Optional (defaults to "Uncategorized")</p>
+                      <p><span className="text-[#737373]">Weight/Reps/Sets</span> - Optional (defaults to 0/0/1)</p>
+                    </div>
+
+                    <button
+                      onClick={downloadTemplate}
+                      className="w-full py-2 px-3 bg-[#262626] hover:bg-[#333] rounded-lg text-sm text-[#f97316] font-medium flex items-center justify-center gap-2 transition-colors"
+                    >
+                      <DownloadIcon className="w-4 h-4" />
+                      Download Template
+                    </button>
+                  </div>
+
+                  <button onClick={() => setStep('mode')} className="btn-secondary w-full">
+                    Back to Import Options
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Step 2.5: Column Mapping (Manual Mode) */}
+          {step === 'mapping' && (
+            <div className="space-y-4">
+              <div className="p-3 bg-[#22c55e]/10 border border-[#22c55e]/20 rounded-xl">
+                <p className="text-sm text-[#22c55e] font-medium">Column auto-detection complete</p>
+                <p className="text-xs text-[#737373] mt-1">Review and adjust the column mapping below</p>
               </div>
 
+              <div className="space-y-3">
+                {/* Required columns */}
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-white">Exercise Column *</label>
+                  <select
+                    value={columnMapping.exercise ?? ''}
+                    onChange={(e) => setColumnMapping({ ...columnMapping, exercise: e.target.value ? parseInt(e.target.value) : null })}
+                    className="input"
+                  >
+                    <option value="">Select column...</option>
+                    {headers.map((h, i) => (
+                      <option key={i} value={i}>{h || `Column ${i + 1}`}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-white">Date</label>
+                    <select
+                      value={columnMapping.date ?? ''}
+                      onChange={(e) => setColumnMapping({ ...columnMapping, date: e.target.value ? parseInt(e.target.value) : null })}
+                      className="input"
+                    >
+                      <option value="">None</option>
+                      {headers.map((h, i) => (
+                        <option key={i} value={i}>{h || `Column ${i + 1}`}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-white">Category</label>
+                    <select
+                      value={columnMapping.category ?? ''}
+                      onChange={(e) => setColumnMapping({ ...columnMapping, category: e.target.value ? parseInt(e.target.value) : null })}
+                      className="input"
+                    >
+                      <option value="">None</option>
+                      {headers.map((h, i) => (
+                        <option key={i} value={i}>{h || `Column ${i + 1}`}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-white">Weight (kg)</label>
+                    <select
+                      value={columnMapping.weight ?? ''}
+                      onChange={(e) => setColumnMapping({ ...columnMapping, weight: e.target.value ? parseInt(e.target.value) : null })}
+                      className="input"
+                    >
+                      <option value="">None</option>
+                      {headers.map((h, i) => (
+                        <option key={i} value={i}>{h || `Column ${i + 1}`}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-white">Reps</label>
+                    <select
+                      value={columnMapping.reps ?? ''}
+                      onChange={(e) => setColumnMapping({ ...columnMapping, reps: e.target.value ? parseInt(e.target.value) : null })}
+                      className="input"
+                    >
+                      <option value="">None</option>
+                      {headers.map((h, i) => (
+                        <option key={i} value={i}>{h || `Column ${i + 1}`}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-white">Sets Count</label>
+                    <select
+                      value={columnMapping.sets ?? ''}
+                      onChange={(e) => setColumnMapping({ ...columnMapping, sets: e.target.value ? parseInt(e.target.value) : null })}
+                      className="input"
+                    >
+                      <option value="">None (default: 1)</option>
+                      {headers.map((h, i) => (
+                        <option key={i} value={i}>{h || `Column ${i + 1}`}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Default category if no category column */}
+                {columnMapping.category === null && (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-white">Default Category</label>
+                    <input
+                      type="text"
+                      value={defaultCategory}
+                      onChange={(e) => setDefaultCategory(e.target.value)}
+                      placeholder="Uncategorized"
+                      className="input"
+                    />
+                    <p className="text-xs text-[#525252]">Used when no category column is mapped</p>
+                  </div>
+                )}
+              </div>
+
+              {/* Preview */}
+              {previewRows.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-white">Data Preview</p>
+                  <div className="overflow-x-auto rounded-lg border border-[#1a1a1a]">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="bg-[#1a1a1a]">
+                          {headers.slice(0, 6).map((h, i) => (
+                            <th key={i} className="px-2 py-1.5 text-left text-[#737373] font-medium">
+                              {h || `Col ${i + 1}`}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {previewRows.slice(0, 3).map((row, ri) => (
+                          <tr key={ri} className="border-t border-[#1a1a1a]">
+                            {row.slice(0, 6).map((cell, ci) => (
+                              <td key={ci} className="px-2 py-1.5 text-white truncate max-w-[100px]">
+                                {String(cell || '')}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="text-xs text-[#525252]">Showing first 3 of {allRows.length - 1} data rows</p>
+                </div>
+              )}
+
               <div className="flex gap-2">
-                <button onClick={() => setStep('config')} className="btn-secondary flex-1">
-                  Change API Key
+                <button onClick={() => { setStep('upload'); setUploadedFiles([]); }} className="btn-secondary flex-1">
+                  Back
                 </button>
                 <button
-                  onClick={processAllFiles}
-                  disabled={readyFilesCount === 0}
+                  onClick={handleManualPreview}
+                  disabled={columnMapping.exercise === null}
                   className="btn-primary flex-1"
                 >
-                  Process {readyFilesCount} file{readyFilesCount !== 1 ? 's' : ''}
+                  Continue
                 </button>
               </div>
             </div>
